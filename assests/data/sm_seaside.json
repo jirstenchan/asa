@@ -1,0 +1,9 @@
+{
+    "id": "sm_seaside", "name": "Sm Seaside",
+    "lat": 0.0, "long": 0.0, "radiusM": 300,
+    "metersPerUnit": 0.35,
+    "floors": [ {"id": "L1", "svg": "assets/maps/sm_seaside_L1.svg", "w": 1000, "h": 700} ],
+    "nodes": [
+        {"id": "main_entrance", "floor": "L1", "x:": 80, "y": 80, "tag": "Main Entrance" }
+    ]
+}
