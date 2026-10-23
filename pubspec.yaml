@@ -37,10 +37,12 @@ dependencies:
   go_router: ^18.0.2
   flutter_svg: ^2.3.0
   geolocator: ^14.1.1
+  flutter_compass: ^0.8.1
   shared_preferences: ^2.5.6
   image_picker: ^1.2.4
   path_provider: ^2.1.6
   path: ^1.9.1
+  supabase_flutter: ^2.18.3
 
 dev_dependencies:
   flutter_test:

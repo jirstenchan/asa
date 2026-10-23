@@ -1,4 +1,50 @@
-enum MapNodeType { place, elevator, escalator, stairs }
+enum MapNodeType {
+  pathway,
+  store,
+  restroom,
+  escalator,
+  elevator,
+  stairs,
+  custom,
+  place,
+}
+
+extension MapNodeTypeDisplayName on MapNodeType {
+  String get displayName => switch (this) {
+    MapNodeType.pathway => 'Pathway',
+    MapNodeType.store => 'Store',
+    MapNodeType.restroom => 'Restroom',
+    MapNodeType.escalator => 'Escalator',
+    MapNodeType.elevator => 'Elevator',
+    MapNodeType.stairs => 'Stairs',
+    MapNodeType.custom => 'Custom spot',
+    MapNodeType.place => 'Place',
+  };
+}
+
+class MapFloor {
+  const MapFloor({
+    required this.id,
+    required this.name,
+    required this.imagePath,
+  });
+
+  final String id;
+  final String name;
+  final String imagePath;
+
+  Map<String, String> toJson() => {
+    'id': id,
+    'name': name,
+    'imagePath': imagePath,
+  };
+
+  factory MapFloor.fromJson(Map<String, dynamic> json) => MapFloor(
+    id: json['id'] as String,
+    name: json['name'] as String,
+    imagePath: json['imagePath'] as String,
+  );
+}
 
 class MapNode {
   const MapNode({
@@ -6,7 +52,9 @@ class MapNode {
     required this.label,
     required this.x,
     required this.y,
-    this.type = MapNodeType.place,
+    this.type = MapNodeType.store,
+    this.floorId = 'ground',
+    this.customTypeName,
   });
 
   final String id;
@@ -14,13 +62,17 @@ class MapNode {
   final double x;
   final double y;
   final MapNodeType type;
+  final String floorId;
+  final String? customTypeName;
 
-  Map<String, Object> toJson() => {
+  Map<String, Object?> toJson() => {
     'id': id,
     'label': label,
     'x': x,
     'y': y,
     'type': type.name,
+    'floorId': floorId,
+    'customTypeName': customTypeName,
   };
 
   factory MapNode.fromJson(Map<String, dynamic> json) => MapNode(
@@ -32,6 +84,8 @@ class MapNode {
       (type) => type.name == json['type'],
       orElse: () => MapNodeType.place,
     ),
+    floorId: json['floorId'] as String? ?? 'ground',
+    customTypeName: json['customTypeName'] as String?,
   );
 }
 
@@ -43,10 +97,8 @@ class MapConnection {
 
   Map<String, String> toJson() => {'from': from, 'to': to};
 
-  factory MapConnection.fromJson(Map<String, dynamic> json) => MapConnection(
-    from: json['from'] as String,
-    to: json['to'] as String,
-  );
+  factory MapConnection.fromJson(Map<String, dynamic> json) =>
+      MapConnection(from: json['from'] as String, to: json['to'] as String);
 }
 
 class MallMap {
@@ -57,6 +109,7 @@ class MallMap {
     required this.nodes,
     required this.connections,
     required this.createdAt,
+    this.floors = const [],
     this.latitude,
     this.longitude,
     this.radiusMeters,
@@ -69,18 +122,24 @@ class MallMap {
   final List<MapNode> nodes;
   final List<MapConnection> connections;
   final DateTime createdAt;
+  final List<MapFloor> floors;
   final double? latitude;
   final double? longitude;
   final double? radiusMeters;
   final List<MapCalibrationPoint> calibrationPoints;
 
-  Map<String, Object> toJson() => {
+  List<MapFloor> get effectiveFloors => floors.isNotEmpty
+      ? floors
+      : [MapFloor(id: 'ground', name: 'Floor 1', imagePath: imagePath)];
+
+  Map<String, Object?> toJson() => {
     'id': id,
     'name': name,
     'imagePath': imagePath,
     'nodes': nodes.map((node) => node.toJson()).toList(),
     'connections': connections.map((edge) => edge.toJson()).toList(),
     'createdAt': createdAt.toIso8601String(),
+    'floors': floors.map((floor) => floor.toJson()).toList(),
     'latitude': ?latitude,
     'longitude': ?longitude,
     'radiusMeters': ?radiusMeters,
@@ -100,6 +159,11 @@ class MallMap {
         .map((edge) => MapConnection.fromJson(edge as Map<String, dynamic>))
         .toList(),
     createdAt: DateTime.parse(json['createdAt'] as String),
+    floors:
+        (json['floors'] as List<dynamic>?)
+            ?.map((floor) => MapFloor.fromJson(floor as Map<String, dynamic>))
+            .toList() ??
+        const [],
     latitude: (json['latitude'] as num?)?.toDouble(),
     longitude: (json['longitude'] as num?)?.toDouble(),
     radiusMeters: (json['radiusMeters'] as num?)?.toDouble(),
@@ -120,18 +184,30 @@ class MapCalibrationPoint {
     required this.y,
     required this.latitude,
     required this.longitude,
+    this.floorId = 'ground',
+    this.floorWidthMeters,
+    this.floorHeightMeters,
+    this.bearingDegrees,
   });
 
   final double x;
   final double y;
   final double latitude;
   final double longitude;
+  final String floorId;
+  final double? floorWidthMeters;
+  final double? floorHeightMeters;
+  final double? bearingDegrees;
 
-  Map<String, double> toJson() => {
+  Map<String, Object?> toJson() => {
     'x': x,
     'y': y,
     'latitude': latitude,
     'longitude': longitude,
+    'floorId': floorId,
+    'floorWidthMeters': ?floorWidthMeters,
+    'floorHeightMeters': ?floorHeightMeters,
+    'bearingDegrees': ?bearingDegrees,
   };
 
   factory MapCalibrationPoint.fromJson(Map<String, dynamic> json) =>
@@ -140,5 +216,9 @@ class MapCalibrationPoint {
         y: (json['y'] as num).toDouble(),
         latitude: (json['latitude'] as num).toDouble(),
         longitude: (json['longitude'] as num).toDouble(),
+        floorId: json['floorId'] as String? ?? 'ground',
+        floorWidthMeters: (json['floorWidthMeters'] as num?)?.toDouble(),
+        floorHeightMeters: (json['floorHeightMeters'] as num?)?.toDouble(),
+        bearingDegrees: (json['bearingDegrees'] as num?)?.toDouble(),
       );
 }

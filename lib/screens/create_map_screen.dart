@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../models/mall_map.dart';
@@ -7,9 +6,16 @@ import '../services/map_store.dart';
 import '../widgets/map_preview.dart';
 
 class CreateMapScreen extends StatefulWidget {
-  const CreateMapScreen({super.key, required this.store});
+  const CreateMapScreen({
+    super.key,
+    required this.store,
+    this.initialMap,
+    this.pickImagePath,
+  });
 
   final MapStore store;
+  final MallMap? initialMap;
+  final Future<String?> Function()? pickImagePath;
 
   @override
   State<CreateMapScreen> createState() => _CreateMapScreenState();
@@ -22,15 +28,42 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
   final _latitudeController = TextEditingController();
   final _longitudeController = TextEditingController();
   final _radiusController = TextEditingController(text: '100');
+  final _floorWidthController = TextEditingController();
+  final _floorHeightController = TextEditingController();
   final _picker = ImagePicker();
+  final List<MapFloor> _floors = [];
   final List<MapNode> _nodes = [];
   final List<MapConnection> _connections = [];
   final List<MapCalibrationPoint> _calibrationPoints = [];
-  String? _imagePath;
+  final Map<String, List<String>> _scaleInputsByFloor = {};
+  String? _activeFloorId;
   String? _selectedNodeId;
-  Position? _pendingCalibrationPosition;
   _EditMode _mode = _EditMode.addNode;
   bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final map = widget.initialMap;
+    if (map == null) return;
+    _nameController.text = map.name;
+    _latitudeController.text = map.latitude?.toString() ?? '';
+    _longitudeController.text = map.longitude?.toString() ?? '';
+    _radiusController.text = map.radiusMeters?.toString() ?? '100';
+    _floors.addAll(map.effectiveFloors);
+    _nodes.addAll(map.nodes);
+    _connections.addAll(map.connections);
+    _calibrationPoints.addAll(map.calibrationPoints);
+    _activeFloorId = _floors.first.id;
+    _loadScaleForFloor(_floors.first.id);
+  }
+
+  MapFloor? get _activeFloor {
+    for (final floor in _floors) {
+      if (floor.id == _activeFloorId) return floor;
+    }
+    return null;
+  }
 
   @override
   void dispose() {
@@ -38,27 +71,223 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
     _latitudeController.dispose();
     _longitudeController.dispose();
     _radiusController.dispose();
+    _floorWidthController.dispose();
+    _floorHeightController.dispose();
     super.dispose();
   }
 
-  Future<void> _chooseImage() async {
-    try {
-      final image = await _picker.pickImage(
-        source: ImageSource.gallery,
-        imageQuality: 90,
+  void _loadScaleForFloor(String floorId) {
+    final cached = _scaleInputsByFloor[floorId];
+    if (cached != null) {
+      _floorWidthController.text = cached[0];
+      _floorHeightController.text = cached[1];
+      return;
+    }
+    MapCalibrationPoint? point;
+    for (final item in _calibrationPoints) {
+      if (item.floorId == floorId) {
+        point = item;
+        break;
+      }
+    }
+    _floorWidthController.text = point?.floorWidthMeters?.toString() ?? '';
+    _floorHeightController.text = point?.floorHeightMeters?.toString() ?? '';
+    _cacheScaleInputs(floorId);
+  }
+
+  void _cacheScaleInputs(String floorId) {
+    _scaleInputsByFloor[floorId] = [
+      _floorWidthController.text,
+      _floorHeightController.text,
+    ];
+  }
+
+  List<MapCalibrationPoint> _gpsCalibrationForMap({
+    required double latitude,
+    required double longitude,
+  }) {
+    final activeFloorId = _activeFloorId;
+    if (activeFloorId != null) _cacheScaleInputs(activeFloorId);
+    final result = <MapCalibrationPoint>[];
+    for (final floor in _floors) {
+      final values = _scaleInputsByFloor[floor.id];
+      if (values == null) continue;
+      final width = double.tryParse(values[0]);
+      final height = double.tryParse(values[1]);
+      if (width == null || width <= 0 || height == null || height <= 0) {
+        continue;
+      }
+      result.add(
+        MapCalibrationPoint(
+          x: .5,
+          y: .5,
+          latitude: latitude,
+          longitude: longitude,
+          floorId: floor.id,
+          floorWidthMeters: width,
+          floorHeightMeters: height,
+          bearingDegrees: 0,
+        ),
       );
-      if (image != null && mounted) {
-        setState(() => _imagePath = image.path);
+    }
+    return result;
+  }
+
+  void _selectFloor(String floorId) {
+    final currentFloorId = _activeFloorId;
+    if (currentFloorId != null) _cacheScaleInputs(currentFloorId);
+    setState(() {
+      _activeFloorId = floorId;
+      if (_mode != _EditMode.connect) _selectedNodeId = null;
+    });
+    _loadScaleForFloor(floorId);
+  }
+
+  Future<void> _chooseImage({MapFloor? floor}) async {
+    try {
+      final imagePath = await _pickImagePath();
+      if (imagePath != null && mounted) {
+        setState(() {
+          if (floor == null) {
+            final newFloor = MapFloor(
+              id: DateTime.now().microsecondsSinceEpoch.toString(),
+              name: 'Floor ${_floors.length + 1}',
+              imagePath: imagePath,
+            );
+            _floors.add(newFloor);
+            _activeFloorId = newFloor.id;
+            _loadScaleForFloor(newFloor.id);
+          } else {
+            final index = _floors.indexWhere((item) => item.id == floor.id);
+            if (index >= 0) {
+              _floors[index] = MapFloor(
+                id: floor.id,
+                name: floor.name,
+                imagePath: imagePath,
+              );
+            }
+          }
+        });
       }
     } catch (error) {
       if (mounted) _showMessage('Could not open your photos: $error');
     }
   }
 
+  Future<String?> _pickImagePath() async {
+    final pickImagePath = widget.pickImagePath;
+    if (pickImagePath != null) return pickImagePath();
+    final image = await _picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 90,
+    );
+    return image?.path;
+  }
+
+  Future<void> _uploadFloorImage() async {
+    final floor = _activeFloor;
+    await _chooseImage(floor: floor);
+  }
+
+  Future<void> _addFloor() async {
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => _FloorNameDialog(
+        title: 'Add a floor',
+        initialName: 'Floor ${_floors.length + 1}',
+        actionLabel: 'Continue',
+      ),
+    );
+    if (!mounted || name == null) return;
+    if (name.trim().isEmpty) {
+      _showMessage('Floor names cannot be empty.');
+      return;
+    }
+    try {
+      final imagePath = await _pickImagePath();
+      if (imagePath == null || !mounted) return;
+      setState(() {
+        final floor = MapFloor(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          name: name.trim(),
+          imagePath: imagePath,
+        );
+        _floors.add(floor);
+        _activeFloorId = floor.id;
+        _loadScaleForFloor(floor.id);
+      });
+    } catch (error) {
+      if (mounted) _showMessage('Could not open your photos: $error');
+    }
+  }
+
+  Future<void> _renameFloor(MapFloor floor) async {
+    final name = await showDialog<String>(
+      context: context,
+      builder: (_) => _FloorNameDialog(
+        title: 'Rename floor',
+        initialName: floor.name,
+        actionLabel: 'Save',
+      ),
+    );
+    if (!mounted || name == null) return;
+    if (name.trim().isEmpty) {
+      _showMessage('Floor names cannot be empty.');
+      return;
+    }
+    setState(() {
+      final index = _floors.indexWhere((item) => item.id == floor.id);
+      if (index >= 0) {
+        _floors[index] = MapFloor(
+          id: floor.id,
+          name: name.trim(),
+          imagePath: floor.imagePath,
+        );
+      }
+    });
+  }
+
+  void _removeFloor(MapFloor floor) {
+    if (_floors.length == 1) {
+      _showMessage('A map must have at least one floor.');
+      return;
+    }
+    setState(() {
+      _floors.removeWhere((item) => item.id == floor.id);
+      _scaleInputsByFloor.remove(floor.id);
+      final removedNodeIds = _nodes
+          .where((node) => node.floorId == floor.id)
+          .map((node) => node.id)
+          .toSet();
+      _nodes.removeWhere((node) => removedNodeIds.contains(node.id));
+      _calibrationPoints.removeWhere((point) => point.floorId == floor.id);
+      _connections.removeWhere(
+        (edge) =>
+            removedNodeIds.contains(edge.from) ||
+            removedNodeIds.contains(edge.to),
+      );
+      _activeFloorId = _floors.first.id;
+      _loadScaleForFloor(_activeFloorId!);
+      if (removedNodeIds.contains(_selectedNodeId)) _selectedNodeId = null;
+    });
+  }
+
   Future<void> _addNode(Offset position) async {
+    final floor = _activeFloor;
+    if (floor == null) return;
     final details = await _askForNodeDetails(title: 'Label this spot');
-    final label = details?.label?.trim();
-    if (details == null || label == null || label.isEmpty || !mounted) return;
+    if (details == null || !mounted) return;
+    final label = details.label?.trim() ?? '';
+    if (label.isEmpty && !_allowsEmptyNodeName(details.type)) {
+      _showMessage('Spot names cannot be empty.');
+      return;
+    }
+    final customTypeName = details.customTypeName?.trim();
+    if (details.type == MapNodeType.custom &&
+        (customTypeName == null || customTypeName.isEmpty)) {
+      _showMessage('Enter a name for this custom node type.');
+      return;
+    }
     setState(() {
       _nodes.add(
         MapNode(
@@ -67,73 +296,14 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
           x: position.dx.clamp(.025, .975).toDouble(),
           y: position.dy.clamp(.035, .965).toDouble(),
           type: details.type,
+          floorId: floor.id,
+          customTypeName: customTypeName,
         ),
       );
     });
   }
 
-  Future<void> _captureCalibrationPoint() async {
-    if (_imagePath == null) {
-      _showMessage('Upload the floor plan before calibrating it.');
-      return;
-    }
-    if (_calibrationPoints.length >= 2) {
-      _showMessage('This map already has two GPS reference points.');
-      return;
-    }
-    try {
-      if (!await Geolocator.isLocationServiceEnabled()) {
-        _showMessage('Turn on location services to capture a reference point.');
-        return;
-      }
-      var permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        _showMessage('Location permission is needed to calibrate this map.');
-        return;
-      }
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
-      );
-      if (!mounted) return;
-      setState(() {
-        _pendingCalibrationPosition = position;
-        _mode = _EditMode.addNode;
-      });
-      _showMessage(
-        'Location captured. Tap its matching point on the floor plan.',
-      );
-    } catch (error) {
-      if (mounted) {
-        _showMessage('Could not capture a GPS reference point: $error');
-      }
-    }
-  }
-
   Future<void> _handleCanvasTap(Offset position) async {
-    final calibration = _pendingCalibrationPosition;
-    if (calibration != null) {
-      setState(() {
-        _calibrationPoints.add(
-          MapCalibrationPoint(
-            x: position.dx,
-            y: position.dy,
-            latitude: calibration.latitude,
-            longitude: calibration.longitude,
-          ),
-        );
-        _pendingCalibrationPosition = null;
-      });
-      _showMessage(
-        'GPS reference point ${_calibrationPoints.length} of 2 saved.',
-      );
-      return;
-    }
     await _addNode(position);
   }
 
@@ -141,20 +311,44 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
     if (_mode == _EditMode.connect) {
       if (_selectedNodeId == null) {
         setState(() => _selectedNodeId = node.id);
-        _showMessage('Now tap the next spot to connect to ${node.label}.');
+        _showMessage(
+          'Now tap the next spot to connect to ${node.label.isEmpty ? node.type.displayName.toLowerCase() : node.label}.',
+        );
         return;
       }
       if (_selectedNodeId == node.id) {
         setState(() => _selectedNodeId = null);
         return;
       }
+      final firstNode = _nodes.firstWhere((item) => item.id == _selectedNodeId);
+      if (firstNode.floorId != node.floorId &&
+          (firstNode.type != node.type ||
+              !{
+                MapNodeType.elevator,
+                MapNodeType.escalator,
+                MapNodeType.stairs,
+              }.contains(node.type))) {
+        _showMessage(
+          'Connect floors using matching elevator, escalator, or stairs nodes.',
+        );
+        return;
+      }
+      final firstNodeId = _selectedNodeId!;
       final alreadyConnected = _connections.any(
         (edge) =>
-            (edge.from == _selectedNodeId && edge.to == node.id) ||
-            (edge.to == _selectedNodeId && edge.from == node.id),
+            (edge.from == firstNodeId && edge.to == node.id) ||
+            (edge.to == firstNodeId && edge.from == node.id),
       );
       if (alreadyConnected) {
-        _showMessage('Those two spots are already connected.');
+        setState(() {
+          _connections.removeWhere(
+            (edge) =>
+                (edge.from == firstNodeId && edge.to == node.id) ||
+                (edge.to == firstNodeId && edge.from == node.id),
+          );
+          _selectedNodeId = null;
+        });
+        _showMessage('Connection removed.');
       } else {
         setState(() {
           _connections.add(MapConnection(from: _selectedNodeId!, to: node.id));
@@ -173,7 +367,10 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
       builder: (_) => _SpotLabelDialog(
         title: 'Edit map spot',
         initialLabel: node.label,
-        initialType: node.type,
+        initialType: node.type == MapNodeType.place
+            ? MapNodeType.store
+            : node.type,
+        initialCustomTypeName: node.customTypeName,
         showDelete: true,
       ),
     );
@@ -186,7 +383,17 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
         );
         if (_selectedNodeId == node.id) _selectedNodeId = null;
       });
-    } else if (result.label case final String label when label.isNotEmpty) {
+    } else if (result.label case final String label) {
+      if (label.isEmpty && !_allowsEmptyNodeName(result.type)) {
+        _showMessage('Spot names cannot be empty.');
+        return;
+      }
+      final customTypeName = result.customTypeName?.trim();
+      if (result.type == MapNodeType.custom &&
+          (customTypeName == null || customTypeName.isEmpty)) {
+        _showMessage('Enter a name for this custom node type.');
+        return;
+      }
       setState(() {
         final index = _nodes.indexWhere((item) => item.id == node.id);
         _nodes[index] = MapNode(
@@ -195,10 +402,10 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
           x: node.x,
           y: node.y,
           type: result.type,
+          floorId: node.floorId,
+          customTypeName: customTypeName,
         );
       });
-    } else {
-      _showMessage('Spot names cannot be empty.');
     }
   }
 
@@ -216,7 +423,8 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
       _showMessage('Give your map a name before saving.');
       return;
     }
-    if (_imagePath == null) {
+    if (_floors.isEmpty ||
+        _floors.any((floor) => floor.imagePath.trim().isEmpty)) {
       _showMessage('Upload a map image before saving.');
       return;
     }
@@ -239,13 +447,18 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
     try {
       final map = await widget.store.saveMap(
         name: name,
-        pickedImagePath: _imagePath!,
+        pickedImagePath: _floors.first.imagePath,
+        existingMap: widget.initialMap,
+        floors: _floors,
         nodes: _nodes,
         connections: _connections,
         latitude: latitude,
         longitude: longitude,
         radiusMeters: radiusMeters,
-        calibrationPoints: _calibrationPoints,
+        calibrationPoints: _gpsCalibrationForMap(
+          latitude: latitude,
+          longitude: longitude,
+        ),
       );
       if (mounted) Navigator.pop(context, map);
     } catch (error) {
@@ -271,7 +484,7 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
           onPressed: () => Navigator.pop(context),
           icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 19),
         ),
-        title: const Text('Create map'),
+        title: Text(widget.initialMap == null ? 'Create map' : 'Edit map'),
         centerTitle: true,
       ),
       body: SafeArea(
@@ -343,13 +556,63 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
               number: '02',
               title: 'Add a floor plan',
               trailing: TextButton.icon(
-                onPressed: _chooseImage,
-                icon: const Icon(Icons.file_upload_outlined, size: 18),
-                label: Text(_imagePath == null ? 'Upload image' : 'Change'),
+                onPressed: _floors.isEmpty
+                    ? _chooseImage
+                    : _activeFloor?.imagePath.isEmpty == true
+                    ? _uploadFloorImage
+                    : _addFloor,
+                icon: Icon(
+                  _floors.isEmpty || _activeFloor?.imagePath.isEmpty == true
+                      ? Icons.file_upload_outlined
+                      : Icons.add_rounded,
+                  size: 18,
+                ),
+                label: Text(
+                  _floors.isEmpty || _activeFloor?.imagePath.isEmpty == true
+                      ? 'Upload image'
+                      : 'Add floor',
+                ),
               ),
             ),
             const SizedBox(height: 10),
-            if (_imagePath == null)
+            if (_floors.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      for (final floor in _floors)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: InputChip(
+                            label: Text(floor.name),
+                            selected: floor.id == _activeFloorId,
+                            onPressed: () => _selectFloor(floor.id),
+                            onDeleted: _floors.length > 1
+                                ? () => _removeFloor(floor)
+                                : null,
+                          ),
+                        ),
+                      TextButton.icon(
+                        onPressed: _activeFloor == null
+                            ? null
+                            : _uploadFloorImage,
+                        icon: const Icon(Icons.image_outlined, size: 17),
+                        label: const Text('Change image'),
+                      ),
+                      TextButton.icon(
+                        onPressed: _activeFloor == null
+                            ? null
+                            : () => _renameFloor(_activeFloor!),
+                        icon: const Icon(Icons.edit_outlined, size: 17),
+                        label: const Text('Rename'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            if (_activeFloor == null)
               InkWell(
                 onTap: _chooseImage,
                 borderRadius: BorderRadius.circular(20),
@@ -387,9 +650,11 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
               )
             else
               MapPreview(
-                height: 230,
-                imagePath: _imagePath,
+                height: 340,
+                key: ValueKey(_activeFloor!.id),
+                imagePath: _activeFloor!.imagePath,
                 nodes: _nodes,
+                floorId: _activeFloor!.id,
                 connections: _connections,
                 selectedNodeId: _selectedNodeId,
                 onCanvasTap: _mode == _EditMode.addNode
@@ -398,6 +663,8 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
                 onNodeTap: _handleNodeTap,
                 emptyLabel: '',
                 showControls: true,
+                compactMarkers: true,
+                maxScale: 14,
               ),
             const SizedBox(height: 25),
             Row(
@@ -414,20 +681,42 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
               ],
             ),
             const SizedBox(height: 12),
-            OutlinedButton.icon(
-              onPressed: _captureCalibrationPoint,
-              icon: const Icon(Icons.my_location_rounded, size: 18),
-              label: Text(
-                _pendingCalibrationPosition == null
-                    ? 'Capture GPS reference point'
-                    : 'Tap the matching floor-plan point',
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    key: const Key('floor-width-meters'),
+                    controller: _floorWidthController,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    onChanged: (_) => _cacheScaleInputs(_activeFloor!.id),
+                    decoration: const InputDecoration(
+                      labelText: 'Floor width (m)',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextField(
+                    key: const Key('floor-height-meters'),
+                    controller: _floorHeightController,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    onChanged: (_) => _cacheScaleInputs(_activeFloor!.id),
+                    decoration: const InputDecoration(
+                      labelText: 'Floor height (m)',
+                    ),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 5),
-            Text(
-              '${_calibrationPoints.length}/2 GPS reference points · '
-              'needed to place your live dot on the floor plan',
-              style: const TextStyle(color: Color(0xFF68727A), fontSize: 11),
+            const Text(
+              'Optional: enter the floor plan size for a better GPS scale. '
+              'Without it, the mall radius estimates the map size.',
+              style: TextStyle(color: Color(0xFF68727A), fontSize: 11),
             ),
             const SizedBox(height: 12),
             Row(
@@ -479,13 +768,13 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
                   const SizedBox(width: 9),
                   Expanded(
                     child: Text(
-                      _imagePath == null
+                      _activeFloor == null
                           ? 'Upload a floor plan first. Then tap the map to place labeled spots.'
                           : _mode == _EditMode.addNode
                           ? 'Tap anywhere on the floor plan to add a labeled spot. Tap a spot to rename or delete it.'
                           : _selectedNodeId == null
-                          ? 'Tap two spots in order to draw a path between them.'
-                          : 'Choose the second spot to finish the connection.',
+                          ? 'Tap two spots to connect them. Tap the same pair again to remove a connection. For floor changes, use matching elevator, escalator, or stairs spots.'
+                          : 'Tap another spot to connect it, or switch floors and tap its matching elevator, escalator, or stairs spot.',
                       style: const TextStyle(
                         color: Color(0xFF68727A),
                         fontSize: 12,
@@ -496,28 +785,6 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
                 ],
               ),
             ),
-            if (_nodes.isNotEmpty) ...[
-              const SizedBox(height: 14),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: _nodes.map((node) {
-                  return InputChip(
-                    avatar: Icon(_nodeTypeIcon(node.type), size: 16),
-                    label: Text(node.label),
-                    onPressed: () => _handleNodeTap(node),
-                    onDeleted: () {
-                      setState(() {
-                        _nodes.remove(node);
-                        _connections.removeWhere(
-                          (edge) => edge.from == node.id || edge.to == node.id,
-                        );
-                      });
-                    },
-                  );
-                }).toList(),
-              ),
-            ],
             const SizedBox(height: 26),
             SizedBox(
               height: 54,
@@ -540,6 +807,59 @@ class _CreateMapScreenState extends State<CreateMapScreen> {
       ),
     );
   }
+}
+
+class _FloorNameDialog extends StatefulWidget {
+  const _FloorNameDialog({
+    required this.title,
+    required this.initialName,
+    required this.actionLabel,
+  });
+
+  final String title;
+  final String initialName;
+  final String actionLabel;
+
+  @override
+  State<_FloorNameDialog> createState() => _FloorNameDialogState();
+}
+
+class _FloorNameDialogState extends State<_FloorNameDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialName);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() => Navigator.pop(context, _controller.text.trim());
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.title),
+    content: TextField(
+      key: const Key('floor-name'),
+      controller: _controller,
+      autofocus: true,
+      textCapitalization: TextCapitalization.words,
+      decoration: const InputDecoration(labelText: 'Floor name'),
+      onSubmitted: (_) => _submit(),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(onPressed: _submit, child: Text(widget.actionLabel)),
+    ],
+  );
 }
 
 class _StepHeading extends StatelessWidget {
@@ -618,17 +938,22 @@ class _ModeButton extends StatelessWidget {
 class _NodeAction {
   const _NodeAction._({
     this.label,
-    this.type = MapNodeType.place,
+    this.type = MapNodeType.store,
+    this.customTypeName,
     this.isDelete = false,
   });
 
-  const _NodeAction.rename(String label, MapNodeType type)
-    : this._(label: label, type: type);
+  const _NodeAction.rename(
+    String label,
+    MapNodeType type, [
+    String? customTypeName,
+  ]) : this._(label: label, type: type, customTypeName: customTypeName);
 
   static const remove = _NodeAction._(isDelete: true);
 
   final String? label;
   final MapNodeType type;
+  final String? customTypeName;
   final bool isDelete;
 }
 
@@ -636,7 +961,8 @@ class _SpotLabelDialog extends StatefulWidget {
   const _SpotLabelDialog({
     required this.title,
     this.initialLabel = '',
-    this.initialType = MapNodeType.place,
+    this.initialType = MapNodeType.store,
+    this.initialCustomTypeName,
     this.actionLabel = 'Save',
     this.showDelete = false,
   });
@@ -644,6 +970,7 @@ class _SpotLabelDialog extends StatefulWidget {
   final String title;
   final String initialLabel;
   final MapNodeType initialType;
+  final String? initialCustomTypeName;
   final String actionLabel;
   final bool showDelete;
 
@@ -653,18 +980,23 @@ class _SpotLabelDialog extends StatefulWidget {
 
 class _SpotLabelDialogState extends State<_SpotLabelDialog> {
   late final TextEditingController _controller;
+  late final TextEditingController _customTypeController;
   late MapNodeType _type;
 
   @override
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.initialLabel);
+    _customTypeController = TextEditingController(
+      text: widget.initialCustomTypeName ?? '',
+    );
     _type = widget.initialType;
   }
 
   @override
   void dispose() {
     _controller.dispose();
+    _customTypeController.dispose();
     super.dispose();
   }
 
@@ -678,18 +1010,29 @@ class _SpotLabelDialogState extends State<_SpotLabelDialog> {
           controller: _controller,
           autofocus: true,
           textCapitalization: TextCapitalization.words,
-          decoration: const InputDecoration(
-            labelText: 'Spot name',
-            hintText: 'e.g. Main entrance',
+          decoration: InputDecoration(
+            labelText: _allowsEmptyNodeName(_type)
+                ? 'Spot name (optional)'
+                : 'Spot name',
+            hintText: _allowsEmptyNodeName(_type)
+                ? 'Leave blank for an unnamed ${_nodeTypeLabel(_type).toLowerCase()}'
+                : 'e.g. Main entrance',
           ),
-          onSubmitted: (value) =>
-              Navigator.pop(context, _NodeAction.rename(value.trim(), _type)),
+          onSubmitted: (value) => Navigator.pop(
+            context,
+            _NodeAction.rename(
+              value.trim(),
+              _type,
+              _customTypeController.text.trim(),
+            ),
+          ),
         ),
         const SizedBox(height: 14),
         DropdownButtonFormField<MapNodeType>(
           initialValue: _type,
           decoration: const InputDecoration(labelText: 'Spot type'),
           items: MapNodeType.values
+              .where((type) => type != MapNodeType.place)
               .map(
                 (type) => DropdownMenuItem(
                   value: type,
@@ -707,6 +1050,17 @@ class _SpotLabelDialogState extends State<_SpotLabelDialog> {
             if (type != null) setState(() => _type = type);
           },
         ),
+        if (_type == MapNodeType.custom) ...[
+          const SizedBox(height: 12),
+          TextField(
+            controller: _customTypeController,
+            textCapitalization: TextCapitalization.words,
+            decoration: const InputDecoration(
+              labelText: 'Custom node type',
+              hintText: 'e.g. Restroom',
+            ),
+          ),
+        ],
       ],
     ),
     actions: [
@@ -722,7 +1076,11 @@ class _SpotLabelDialogState extends State<_SpotLabelDialog> {
       FilledButton(
         onPressed: () => Navigator.pop(
           context,
-          _NodeAction.rename(_controller.text.trim(), _type),
+          _NodeAction.rename(
+            _controller.text.trim(),
+            _type,
+            _customTypeController.text.trim(),
+          ),
         ),
         child: Text(widget.actionLabel),
       ),
@@ -731,15 +1089,31 @@ class _SpotLabelDialogState extends State<_SpotLabelDialog> {
 }
 
 String _nodeTypeLabel(MapNodeType type) => switch (type) {
-  MapNodeType.place => 'Place',
-  MapNodeType.elevator => 'Elevator',
-  MapNodeType.escalator => 'Escalator',
+  MapNodeType.pathway => 'Pathway',
+  MapNodeType.store => 'Stores',
+  MapNodeType.restroom => 'Restroom',
+  MapNodeType.elevator => 'Elevators',
+  MapNodeType.escalator => 'Escalators',
   MapNodeType.stairs => 'Stairs',
+  MapNodeType.custom => 'Custom',
+  MapNodeType.place => 'Place',
 };
 
 IconData _nodeTypeIcon(MapNodeType type) => switch (type) {
-  MapNodeType.place => Icons.place_outlined,
+  MapNodeType.pathway => Icons.route_rounded,
+  MapNodeType.store => Icons.storefront_outlined,
+  MapNodeType.restroom => Icons.wc_rounded,
   MapNodeType.elevator => Icons.elevator_rounded,
   MapNodeType.escalator => Icons.escalator_rounded,
   MapNodeType.stairs => Icons.stairs_rounded,
+  MapNodeType.custom => Icons.tune_rounded,
+  MapNodeType.place => Icons.place_outlined,
 };
+
+bool _allowsEmptyNodeName(MapNodeType type) => const {
+  MapNodeType.pathway,
+  MapNodeType.restroom,
+  MapNodeType.elevator,
+  MapNodeType.escalator,
+  MapNodeType.stairs,
+}.contains(type);

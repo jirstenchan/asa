@@ -1,9 +1,13 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_compass/flutter_compass.dart';
+import 'package:geolocator/geolocator.dart';
 
 import '../models/mall_map.dart';
+import '../services/geo_location.dart';
 
 class MapPreview extends StatefulWidget {
   const MapPreview({
@@ -11,35 +15,45 @@ class MapPreview extends StatefulWidget {
     required this.height,
     this.imagePath,
     this.nodes = const [],
+    this.floorId = 'ground',
     this.connections = const [],
     this.calibrationPoints = const [],
     this.routeNodeIds,
     this.currentNodeId,
     this.destinationNodeId,
     this.selectedNodeId,
-    this.trackerProgress,
     this.deviceLocation,
     this.onCanvasTap,
     this.onNodeTap,
     this.emptyLabel = 'Add a floor plan to preview this map',
     this.showControls = false,
+    this.maxScale = 6,
+    this.fillImageWidth = false,
+    this.compactMarkers = false,
+    this.allowFullScreen = true,
+    this.onFullScreenTap,
   });
 
   final double height;
   final String? imagePath;
   final List<MapNode> nodes;
+  final String floorId;
   final List<MapConnection> connections;
   final List<MapCalibrationPoint> calibrationPoints;
   final List<String>? routeNodeIds;
   final String? currentNodeId;
   final String? destinationNodeId;
   final String? selectedNodeId;
-  final double? trackerProgress;
   final Offset? deviceLocation;
   final ValueChanged<Offset>? onCanvasTap;
   final ValueChanged<MapNode>? onNodeTap;
   final String emptyLabel;
   final bool showControls;
+  final double maxScale;
+  final bool fillImageWidth;
+  final bool compactMarkers;
+  final bool allowFullScreen;
+  final VoidCallback? onFullScreenTap;
 
   @override
   State<MapPreview> createState() => _MapPreviewState();
@@ -49,12 +63,15 @@ class _MapPreviewState extends State<MapPreview> {
   final TransformationController _transformController =
       TransformationController();
   Size? _imageSize;
-  double _zoom = 1;
+  Offset? _zoomFocus;
+  StreamSubscription<CompassEvent>? _compassSubscription;
+  double? _headingDegrees;
 
   @override
   void initState() {
     super.initState();
     _loadImageSize();
+    if (widget.deviceLocation != null) _listenForHeading();
   }
 
   @override
@@ -63,20 +80,36 @@ class _MapPreviewState extends State<MapPreview> {
     if (oldWidget.imagePath != widget.imagePath) {
       _imageSize = null;
       _transformController.value = Matrix4.identity();
-      _zoom = 1;
       _loadImageSize();
     }
+    if (oldWidget.deviceLocation == null && widget.deviceLocation != null) {
+      _listenForHeading();
+    } else if (oldWidget.deviceLocation != null &&
+        widget.deviceLocation == null) {
+      unawaited(_compassSubscription?.cancel());
+      _compassSubscription = null;
+      _headingDegrees = null;
+    }
+  }
+
+  void _listenForHeading() {
+    _compassSubscription = FlutterCompass.events?.listen((event) {
+      final heading = event.heading;
+      if (!mounted || heading == null || !heading.isFinite) return;
+      setState(() => _headingDegrees = heading);
+    });
   }
 
   @override
   void dispose() {
+    unawaited(_compassSubscription?.cancel());
     _transformController.dispose();
     super.dispose();
   }
 
   void _loadImageSize() {
     final path = widget.imagePath;
-    if (path == null) return;
+    if (path == null || path.isEmpty) return;
     final provider = FileImage(File(path));
     final stream = provider.resolve(ImageConfiguration.empty);
     late ImageStreamListener listener;
@@ -100,32 +133,40 @@ class _MapPreviewState extends State<MapPreview> {
   }
 
   void _zoomBy(double factor, Size size) {
-    final nextZoom = (_zoom * factor).clamp(1.0, 6.0).toDouble();
-    final center = Offset(size.width / 2, size.height / 2);
+    final currentZoom = _transformController.value.getMaxScaleOnAxis();
+    final nextZoom = (currentZoom * factor)
+        .clamp(1.0, widget.maxScale)
+        .toDouble();
+    if (nextZoom == currentZoom) return;
+    final focus = _zoomFocus ?? Offset(size.width / 2, size.height / 2);
+    final zoomFactor = nextZoom / currentZoom;
     _transformController.value = Matrix4.identity()
-      ..translateByDouble(
-        -center.dx * (nextZoom - 1),
-        -center.dy * (nextZoom - 1),
-        0,
-        1,
-      )
-      ..scaleByDouble(nextZoom, nextZoom, 1, 1);
-    setState(() => _zoom = nextZoom);
+      ..translateByDouble(focus.dx, focus.dy, 0, 1)
+      ..scaleByDouble(zoomFactor, zoomFactor, 1, 1)
+      ..translateByDouble(-focus.dx, -focus.dy, 0, 1)
+      ..multiply(_transformController.value);
   }
 
   void _openFullScreen() {
+    final onFullScreenTap = widget.onFullScreenTap;
+    if (onFullScreenTap != null) {
+      onFullScreenTap();
+      return;
+    }
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => FullScreenMapScreen(
           imagePath: widget.imagePath,
           nodes: widget.nodes,
+          floorId: widget.floorId,
           connections: widget.connections,
           calibrationPoints: widget.calibrationPoints,
           routeNodeIds: widget.routeNodeIds,
           currentNodeId: widget.currentNodeId,
           destinationNodeId: widget.destinationNodeId,
-          trackerProgress: widget.trackerProgress,
           deviceLocation: widget.deviceLocation,
+          compactMarkers: widget.compactMarkers,
+          maxScale: widget.maxScale,
         ),
       ),
     );
@@ -142,7 +183,12 @@ class _MapPreviewState extends State<MapPreview> {
             ? constraints.maxHeight
             : widget.height;
         final size = Size(width, height);
-        final imageRect = _containedRect(size, _imageSize);
+        final imageRect = widget.fillImageWidth
+            ? _widthFittedRect(size, _imageSize)
+            : _containedRect(size, _imageSize);
+        final visibleNodes = widget.nodes
+            .where((node) => node.floorId == widget.floorId)
+            .toList(growable: false);
         final canvas = SizedBox(
           width: size.width,
           height: size.height,
@@ -151,7 +197,7 @@ class _MapPreviewState extends State<MapPreview> {
             children: [
               Positioned.fromRect(
                 rect: imageRect,
-                child: widget.imagePath == null
+                child: widget.imagePath == null || widget.imagePath!.isEmpty
                     ? ColoredBox(
                         color: const Color(0xFFE8ECEF),
                         child: Center(
@@ -186,12 +232,11 @@ class _MapPreviewState extends State<MapPreview> {
                 child: IgnorePointer(
                   child: CustomPaint(
                     painter: _MapPathPainter(
-                      nodes: widget.nodes,
+                      nodes: visibleNodes,
                       connections: widget.connections,
                       calibrationPoints: widget.calibrationPoints,
                       routeNodeIds: widget.routeNodeIds,
                       imageRect: imageRect,
-                      trackerProgress: widget.trackerProgress,
                       deviceLocation: widget.deviceLocation,
                       currentNodeId: widget.currentNodeId,
                       destinationNodeId: widget.destinationNodeId,
@@ -216,22 +261,30 @@ class _MapPreviewState extends State<MapPreview> {
                     },
                   ),
                 ),
-              for (final node in widget.nodes)
-                Positioned(
-                  left: imageRect.left + node.x * imageRect.width - 23,
-                  top: imageRect.top + node.y * imageRect.height - 30,
-                  child: GestureDetector(
-                    onTap: widget.onNodeTap == null
-                        ? null
-                        : () => widget.onNodeTap!(node),
-                    child: _NodeMarker(
-                      node: node,
-                      selected: node.id == widget.selectedNodeId,
-                      isCurrent: node.id == widget.currentNodeId,
-                      isDestination: node.id == widget.destinationNodeId,
+              if (!widget.compactMarkers)
+                for (final node in visibleNodes)
+                  Positioned(
+                    left:
+                        imageRect.left +
+                        node.x * imageRect.width -
+                        (widget.compactMarkers ? 33 : 23),
+                    top:
+                        imageRect.top +
+                        node.y * imageRect.height -
+                        (widget.compactMarkers ? 23 : 30),
+                    child: GestureDetector(
+                      onTap: widget.onNodeTap == null
+                          ? null
+                          : () => widget.onNodeTap!(node),
+                      child: _NodeMarker(
+                        node: node,
+                        selected: node.id == widget.selectedNodeId,
+                        isCurrent: node.id == widget.currentNodeId,
+                        isDestination: node.id == widget.destinationNodeId,
+                        compact: widget.compactMarkers,
+                      ),
                     ),
                   ),
-                ),
             ],
           ),
         );
@@ -243,13 +296,130 @@ class _MapPreviewState extends State<MapPreview> {
             child: Stack(
               fit: StackFit.expand,
               children: [
-                InteractiveViewer(
-                  transformationController: _transformController,
-                  constrained: true,
-                  minScale: 1,
-                  maxScale: 6,
-                  child: canvas,
+                Listener(
+                  onPointerDown: (event) {
+                    final renderObject = context.findRenderObject();
+                    if (renderObject is RenderBox) {
+                      _zoomFocus = renderObject.globalToLocal(event.position);
+                    }
+                  },
+                  onPointerMove: (event) {
+                    final renderObject = context.findRenderObject();
+                    if (renderObject is RenderBox) {
+                      _zoomFocus = renderObject.globalToLocal(event.position);
+                    }
+                  },
+                  child: InteractiveViewer(
+                    transformationController: _transformController,
+                    constrained: true,
+                    minScale: 1,
+                    maxScale: widget.maxScale,
+                    child: canvas,
+                  ),
                 ),
+                if (widget.compactMarkers)
+                  AnimatedBuilder(
+                    animation: _transformController,
+                    builder: (context, _) {
+                      final matrix = _transformController.value;
+                      return Stack(
+                        clipBehavior: Clip.hardEdge,
+                        children: [
+                          for (final node in visibleNodes)
+                            Builder(
+                              builder: (context) {
+                                final mapPoint = Offset(
+                                  imageRect.left + node.x * imageRect.width,
+                                  imageRect.top + node.y * imageRect.height,
+                                );
+                                final screenPoint = Offset(
+                                  matrix[0] * mapPoint.dx + matrix[12],
+                                  matrix[5] * mapPoint.dy + matrix[13],
+                                );
+                                return Positioned(
+                                  left: screenPoint.dx - 27,
+                                  top: screenPoint.dy - 9,
+                                  child: GestureDetector(
+                                    onTap: widget.onNodeTap == null
+                                        ? null
+                                        : () => widget.onNodeTap!(node),
+                                    child: _NodeMarker(
+                                      node: node,
+                                      selected:
+                                          node.id == widget.selectedNodeId,
+                                      isCurrent:
+                                          node.id == widget.currentNodeId,
+                                      isDestination:
+                                          node.id == widget.destinationNodeId,
+                                      compact: true,
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                        ],
+                      );
+                    },
+                  ),
+                if (widget.deviceLocation != null)
+                  AnimatedBuilder(
+                    animation: _transformController,
+                    builder: (context, _) {
+                      final matrix = _transformController.value;
+                      final mapPoint = Offset(
+                        imageRect.left +
+                            widget.deviceLocation!.dx * imageRect.width,
+                        imageRect.top +
+                            widget.deviceLocation!.dy * imageRect.height,
+                      );
+                      final screenPoint = Offset(
+                        matrix[0] * mapPoint.dx + matrix[12],
+                        matrix[5] * mapPoint.dy + matrix[13],
+                      );
+                      return Positioned(
+                        left: screenPoint.dx - 19,
+                        top: screenPoint.dy - 19,
+                        child: IgnorePointer(
+                          child: SizedBox(
+                            width: 38,
+                            height: 38,
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                if (_headingDegrees != null)
+                                  Transform.rotate(
+                                    angle:
+                                        (_headingDegrees! + 90) * math.pi / 180,
+                                    child: CustomPaint(
+                                      size: const Size(38, 38),
+                                      painter: _HeadingConePainter(),
+                                    ),
+                                  ),
+                                Container(
+                                  width: 13,
+                                  height: 13,
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF1677F8),
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: Colors.white,
+                                      width: 2,
+                                    ),
+                                    boxShadow: const [
+                                      BoxShadow(
+                                        color: Color(0x663078FF),
+                                        blurRadius: 3,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
                 if (widget.showControls)
                   Positioned(
                     right: 9,
@@ -267,12 +437,14 @@ class _MapPreviewState extends State<MapPreview> {
                           icon: Icons.remove,
                           onPressed: () => _zoomBy(0.8, size),
                         ),
-                        const SizedBox(height: 6),
-                        _MapControl(
-                          tooltip: 'View full screen',
-                          icon: Icons.fullscreen,
-                          onPressed: _openFullScreen,
-                        ),
+                        if (widget.allowFullScreen) ...[
+                          const SizedBox(height: 6),
+                          _MapControl(
+                            tooltip: 'View full screen',
+                            icon: Icons.fullscreen,
+                            onPressed: _openFullScreen,
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -285,29 +457,102 @@ class _MapPreviewState extends State<MapPreview> {
   }
 }
 
-class FullScreenMapScreen extends StatelessWidget {
+class FullScreenMapScreen extends StatefulWidget {
   const FullScreenMapScreen({
     super.key,
     this.imagePath,
     this.nodes = const [],
+    this.floorId = 'ground',
     this.connections = const [],
     this.calibrationPoints = const [],
     this.routeNodeIds,
     this.currentNodeId,
     this.destinationNodeId,
-    this.trackerProgress,
     this.deviceLocation,
+    this.trackLiveLocation = false,
+    this.locationProvider,
+    this.initialPosition,
+    this.initialMapLocation,
+    this.compactMarkers = false,
+    this.maxScale = 6,
   });
 
   final String? imagePath;
   final List<MapNode> nodes;
+  final String floorId;
   final List<MapConnection> connections;
   final List<MapCalibrationPoint> calibrationPoints;
   final List<String>? routeNodeIds;
   final String? currentNodeId;
   final String? destinationNodeId;
-  final double? trackerProgress;
   final Offset? deviceLocation;
+  final bool trackLiveLocation;
+  final LocationProvider? locationProvider;
+  final Position? initialPosition;
+  final Offset? initialMapLocation;
+  final bool compactMarkers;
+  final double maxScale;
+
+  @override
+  State<FullScreenMapScreen> createState() => _FullScreenMapScreenState();
+}
+
+class _FullScreenMapScreenState extends State<FullScreenMapScreen> {
+  StreamSubscription<Position>? _subscription;
+  Offset? _deviceLocation;
+  Position? _previousPosition;
+
+  @override
+  void initState() {
+    super.initState();
+    _deviceLocation = widget.initialMapLocation ?? widget.deviceLocation;
+    _previousPosition = widget.initialPosition;
+    if (widget.trackLiveLocation && widget.locationProvider != null) {
+      _subscription = widget.locationProvider!.watchPosition().listen(
+        _updatePosition,
+        onError: (Object error) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Live location updates stopped: $error')),
+            );
+          }
+        },
+      );
+    }
+  }
+
+  void _updatePosition(Position position) {
+    final previous = _previousPosition;
+    var nextLocation = _deviceLocation;
+    if (previous != null && nextLocation != null) {
+      final update = estimateRelativeMovement(
+        previous: previous,
+        current: position,
+        calibrationPoints: widget.calibrationPoints,
+      );
+      final movement = update.mapOffset;
+      if (movement != null) {
+        nextLocation = clampLocationToMap(
+          Offset(nextLocation.dx + movement.dx, nextLocation.dy + movement.dy),
+        );
+      }
+      if (update.shouldAdvanceBaseline) {
+        _previousPosition = position;
+      }
+    } else {
+      _previousPosition = position;
+    }
+    if (!mounted) return;
+    setState(() {
+      _deviceLocation = nextLocation;
+    });
+  }
+
+  @override
+  void dispose() {
+    unawaited(_subscription?.cancel());
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -326,16 +571,19 @@ class FullScreenMapScreen extends StatelessWidget {
         child: LayoutBuilder(
           builder: (context, constraints) => MapPreview(
             height: constraints.maxHeight,
-            imagePath: imagePath,
-            nodes: nodes,
-            connections: connections,
-            calibrationPoints: calibrationPoints,
-            routeNodeIds: routeNodeIds,
-            currentNodeId: currentNodeId,
-            destinationNodeId: destinationNodeId,
-            trackerProgress: trackerProgress,
-            deviceLocation: deviceLocation,
+            imagePath: widget.imagePath,
+            nodes: widget.nodes,
+            floorId: widget.floorId,
+            connections: widget.connections,
+            calibrationPoints: widget.calibrationPoints,
+            routeNodeIds: widget.routeNodeIds,
+            currentNodeId: widget.currentNodeId,
+            destinationNodeId: widget.destinationNodeId,
+            deviceLocation: _deviceLocation,
             showControls: true,
+            allowFullScreen: false,
+            compactMarkers: widget.compactMarkers,
+            maxScale: widget.maxScale,
           ),
         ),
       ),
@@ -376,20 +624,29 @@ class _NodeMarker extends StatelessWidget {
     required this.selected,
     required this.isCurrent,
     required this.isDestination,
+    required this.compact,
   });
 
   final MapNode node;
   final bool selected;
   final bool isCurrent;
   final bool isDestination;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
+    final markerLabel = node.type == MapNodeType.custom
+        ? '${node.customTypeName}: ${node.label}'
+        : node.label;
     final icon = switch (node.type) {
-      MapNodeType.place => Icons.place_rounded,
+      MapNodeType.pathway => Icons.route_rounded,
+      MapNodeType.store => Icons.storefront_rounded,
+      MapNodeType.restroom => Icons.wc_rounded,
       MapNodeType.elevator => Icons.elevator_rounded,
       MapNodeType.escalator => Icons.escalator_rounded,
       MapNodeType.stairs => Icons.stairs_rounded,
+      MapNodeType.custom => Icons.tune_rounded,
+      MapNodeType.place => Icons.place_rounded,
     };
     final color = isCurrent
         ? const Color(0xFF1477F8)
@@ -400,13 +657,13 @@ class _NodeMarker extends StatelessWidget {
         : const Color(0xFF20272E);
 
     return SizedBox(
-      width: 88,
+      width: compact ? 54 : 88,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 32,
-            height: 32,
+            width: compact ? 18 : 32,
+            height: compact ? 18 : 32,
             decoration: BoxDecoration(
               color: color,
               shape: BoxShape.circle,
@@ -419,11 +676,11 @@ class _NodeMarker extends StatelessWidget {
                 ),
               ],
             ),
-            child: Icon(icon, color: Colors.white, size: 18),
+            child: Icon(icon, color: Colors.white, size: compact ? 10 : 18),
           ),
-          if (node.label.isNotEmpty)
+          if (markerLabel.isNotEmpty)
             Container(
-              constraints: const BoxConstraints(maxWidth: 88),
+              constraints: BoxConstraints(maxWidth: compact ? 54 : 88),
               margin: const EdgeInsets.only(top: 2),
               padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
               decoration: BoxDecoration(
@@ -431,11 +688,11 @@ class _NodeMarker extends StatelessWidget {
                 borderRadius: BorderRadius.circular(5),
               ),
               child: Text(
-                node.label,
+                markerLabel,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 9,
+                style: TextStyle(
+                  fontSize: compact ? 7 : 9,
                   fontWeight: FontWeight.w700,
                 ),
               ),
@@ -446,6 +703,27 @@ class _NodeMarker extends StatelessWidget {
   }
 }
 
+class _HeadingConePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final cone = Path()
+      ..moveTo(center.dx, center.dy)
+      ..lineTo(center.dx - 7, center.dy - 16)
+      ..quadraticBezierTo(
+        center.dx,
+        center.dy - 20,
+        center.dx + 7,
+        center.dy - 16,
+      )
+      ..close();
+    canvas.drawPath(cone, Paint()..color = const Color(0x553078FF));
+  }
+
+  @override
+  bool shouldRepaint(covariant _HeadingConePainter oldDelegate) => false;
+}
+
 class _MapPathPainter extends CustomPainter {
   const _MapPathPainter({
     required this.nodes,
@@ -453,7 +731,6 @@ class _MapPathPainter extends CustomPainter {
     required this.calibrationPoints,
     required this.routeNodeIds,
     required this.imageRect,
-    required this.trackerProgress,
     required this.deviceLocation,
     required this.currentNodeId,
     required this.destinationNodeId,
@@ -464,7 +741,6 @@ class _MapPathPainter extends CustomPainter {
   final List<MapCalibrationPoint> calibrationPoints;
   final List<String>? routeNodeIds;
   final Rect imageRect;
-  final double? trackerProgress;
   final Offset? deviceLocation;
   final String? currentNodeId;
   final String? destinationNodeId;
@@ -538,7 +814,7 @@ class _MapPathPainter extends CustomPainter {
         path,
         Paint()
           ..color = const Color(0xF0FFFFFF)
-          ..strokeWidth = 12
+          ..strokeWidth = 7
           ..strokeCap = StrokeCap.round
           ..strokeJoin = StrokeJoin.round
           ..style = PaintingStyle.stroke,
@@ -546,8 +822,8 @@ class _MapPathPainter extends CustomPainter {
       canvas.drawPath(
         path,
         Paint()
-          ..color = const Color(0xFF0878FF)
-          ..strokeWidth = 7
+          ..color = const Color(0xFFE87521)
+          ..strokeWidth = 4
           ..strokeCap = StrokeCap.round
           ..strokeJoin = StrokeJoin.round
           ..style = PaintingStyle.stroke,
@@ -555,45 +831,23 @@ class _MapPathPainter extends CustomPainter {
       for (var index = 0; index < points.length - 1; index++) {
         final start = points[index];
         final end = points[index + 1];
-        final middle = Offset(
-          (start.dx + end.dx) / 2,
-          (start.dy + end.dy) / 2,
-        );
+        final middle = Offset((start.dx + end.dx) / 2, (start.dy + end.dy) / 2);
         final angle = math.atan2(end.dy - start.dy, end.dx - start.dx);
         final arrow = Path()
-          ..moveTo(middle.dx + 7 * math.cos(angle), middle.dy + 7 * math.sin(angle))
-          ..lineTo(
-            middle.dx - 6 * math.cos(angle - .65),
-            middle.dy - 6 * math.sin(angle - .65),
+          ..moveTo(
+            middle.dx + 5 * math.cos(angle),
+            middle.dy + 5 * math.sin(angle),
           )
           ..lineTo(
-            middle.dx - 6 * math.cos(angle + .65),
-            middle.dy - 6 * math.sin(angle + .65),
+            middle.dx - 4 * math.cos(angle - .65),
+            middle.dy - 4 * math.sin(angle - .65),
+          )
+          ..lineTo(
+            middle.dx - 4 * math.cos(angle + .65),
+            middle.dy - 4 * math.sin(angle + .65),
           )
           ..close();
         canvas.drawPath(arrow, Paint()..color = Colors.white);
-      }
-
-      final progress = trackerProgress;
-      if (progress != null && route.length > 1) {
-        final scaled = progress.clamp(0.0, 1.0) * (points.length - 1);
-        final segment = math.min(scaled.floor(), points.length - 2);
-        final fraction = scaled - segment;
-        final point = Offset.lerp(
-          points[segment],
-          points[segment + 1],
-          fraction,
-        )!;
-        canvas.drawCircle(point, 12, Paint()..color = Colors.white);
-        canvas.drawCircle(point, 8, Paint()..color = const Color(0xFF0878FF));
-        canvas.drawCircle(
-          point,
-          14,
-          Paint()
-            ..color = const Color(0x550878FF)
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 2,
-        );
       }
     }
 
@@ -604,21 +858,10 @@ class _MapPathPainter extends CustomPainter {
       final color = id == currentNodeId
           ? const Color(0xFF1477F8)
           : const Color(0xFFE92332);
-      canvas.drawCircle(point, 20, Paint()..color = color.withValues(alpha: .14));
-    }
-
-    final liveLocation = deviceLocation;
-    if (liveLocation != null) {
-      final point = Offset(
-        imageRect.left + liveLocation.dx * imageRect.width,
-        imageRect.top + liveLocation.dy * imageRect.height,
-      );
-      canvas.drawCircle(point, 15, Paint()..color = const Color(0x442A85FF));
-      canvas.drawCircle(point, 8, Paint()..color = Colors.white);
       canvas.drawCircle(
         point,
-        6,
-        Paint()..color = const Color(0xFF1677F8),
+        20,
+        Paint()..color = color.withValues(alpha: .14),
       );
     }
   }
@@ -630,7 +873,6 @@ class _MapPathPainter extends CustomPainter {
       oldDelegate.calibrationPoints != calibrationPoints ||
       oldDelegate.routeNodeIds != routeNodeIds ||
       oldDelegate.imageRect != imageRect ||
-      oldDelegate.trackerProgress != trackerProgress ||
       oldDelegate.deviceLocation != deviceLocation ||
       oldDelegate.currentNodeId != currentNodeId ||
       oldDelegate.destinationNodeId != destinationNodeId;
@@ -650,6 +892,19 @@ Rect _containedRect(Size viewport, Size? imageSize) {
     (viewport.width - width) / 2,
     (viewport.height - height) / 2,
     width,
+    height,
+  );
+}
+
+Rect _widthFittedRect(Size viewport, Size? imageSize) {
+  if (imageSize == null || imageSize.width <= 0 || imageSize.height <= 0) {
+    return Offset.zero & viewport;
+  }
+  final height = viewport.width * imageSize.height / imageSize.width;
+  return Rect.fromLTWH(
+    0,
+    (viewport.height - height) / 2,
+    viewport.width,
     height,
   );
 }

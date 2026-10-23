@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Your location is used to confirm you are at the mall and to show your live position on its calibrated map.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Select floor-plan images to create and edit mall maps.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

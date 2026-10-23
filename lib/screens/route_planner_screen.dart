@@ -15,6 +15,7 @@ class RoutePlannerScreen extends StatefulWidget {
     required this.nodes,
     required this.connections,
     this.imagePath,
+    this.floors = const [],
     this.latitude,
     this.longitude,
     this.radiusMeters,
@@ -24,6 +25,7 @@ class RoutePlannerScreen extends StatefulWidget {
 
   final String mallName;
   final String? imagePath;
+  final List<MapFloor> floors;
   final List<MapNode> nodes;
   final List<MapConnection> connections;
   final double? latitude;
@@ -45,13 +47,86 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
   bool _isNavigating = false;
   bool _hasArrived = false;
   bool _isStarting = false;
-  bool? _isInsideMall;
   Position? _position;
+  Position? _previousMovementPosition;
+  Offset? _liveMapLocation;
+  String? _liveMapFloorId;
+  String? _previewingFloorId;
   String? _locationStatus;
+  String? _selectedFloorId;
+
+  List<MapFloor> get _effectiveFloors => widget.floors.isNotEmpty
+      ? widget.floors
+      : [
+          MapFloor(
+            id: 'ground',
+            name: 'Floor 1',
+            imagePath: widget.imagePath ?? '',
+          ),
+        ];
+
+  MapFloor get _activeFloor => _effectiveFloors.firstWhere(
+    (floor) => floor.id == _selectedFloorId,
+    orElse: () => _effectiveFloors.first,
+  );
+
+  List<MapCalibrationPoint> _calibrationForFloor(String floorId) {
+    final configured = widget.calibrationPoints
+        .where((point) => point.floorId == floorId)
+        .toList(growable: false);
+    if (hasUsableLocationCalibration(configured)) return configured;
+
+    final latitude = widget.latitude;
+    final longitude = widget.longitude;
+    final radius = widget.radiusMeters;
+    if (latitude == null ||
+        longitude == null ||
+        radius == null ||
+        radius <= 0) {
+      return const [];
+    }
+
+    // Use the mall geofence as a rough scale when the floor has no dimensions.
+    return [
+      MapCalibrationPoint(
+        x: .5,
+        y: .5,
+        latitude: latitude,
+        longitude: longitude,
+        floorId: floorId,
+        floorWidthMeters: radius * 2,
+        floorHeightMeters: radius * 2,
+        bearingDegrees: 0,
+      ),
+    ];
+  }
+
+  List<MapConnection> _connectionsForRoute(List<MapNode>? route) {
+    if (route == null || route.length < 2) return const [];
+    final routeEdges = <String>{};
+    for (var index = 0; index < route.length - 1; index++) {
+      final from = route[index].id;
+      final to = route[index + 1].id;
+      routeEdges.add('$from\u0000$to');
+      routeEdges.add('$to\u0000$from');
+    }
+    return widget.connections
+        .where((edge) => routeEdges.contains('${edge.from}\u0000${edge.to}'))
+        .toList(growable: false);
+  }
+
+  List<MapNode> _nodesForRoute(List<MapNode>? route) {
+    if (route == null) return widget.nodes;
+    final routeNodeIds = route.map((node) => node.id).toSet();
+    return widget.nodes
+        .where((node) => routeNodeIds.contains(node.id))
+        .toList(growable: false);
+  }
 
   @override
   void initState() {
     super.initState();
+    _selectedFloorId = _effectiveFloors.first.id;
     _locationProvider =
         widget.locationProvider ?? const GeolocatorLocationProvider();
   }
@@ -68,7 +143,10 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
     _isNavigating = false;
     _hasArrived = false;
     _position = null;
-    _isInsideMall = null;
+    _previousMovementPosition = null;
+    _liveMapLocation = null;
+    _liveMapFloorId = null;
+    _previewingFloorId = null;
     _locationStatus = null;
     _isStarting = false;
   }
@@ -106,45 +184,39 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
     }
     setState(() {
       _route = route;
+      _selectedFloorId = route.first.floorId;
       _isNavigating = false;
       _hasArrived = false;
+      _previousMovementPosition = null;
+      _liveMapLocation = null;
+      _liveMapFloorId = null;
+      _previewingFloorId = null;
     });
   }
 
   Future<void> _startNavigation() async {
     if (_route == null) return;
-    final latitude = widget.latitude;
-    final longitude = widget.longitude;
-    final radius = widget.radiusMeters;
-    if (latitude == null || longitude == null || radius == null) {
-      _showMessage('This map needs mall GPS coordinates and a radius.');
-      return;
-    }
-    if (widget.calibrationPoints.length < 2) {
-      _showMessage('Add two GPS reference points to this floor plan first.');
+    if (!hasUsableLocationCalibration(
+      _calibrationForFloor(_route!.first.floorId),
+    )) {
+      _showMessage('Set a floor scale or mall radius before navigating.');
       return;
     }
     setState(() {
       _isStarting = true;
-      _locationStatus = 'Checking your location…';
+      _locationStatus = 'Checking movement tracking…';
     });
     try {
       await _locationProvider.ensurePermission();
       final position = await _locationProvider.getCurrentPosition();
       if (!mounted) return;
-      if (!_isPositionInsideMall(position)) {
-        setState(() {
-          _isStarting = false;
-          _isInsideMall = false;
-          _position = position;
-          _locationStatus =
-              'You appear to be outside the ${radius.round()} m mall area.';
-        });
-        return;
-      }
       setState(() {
         _isStarting = false;
         _isNavigating = true;
+        _previousMovementPosition = position;
+        _liveMapLocation = Offset(_route!.first.x, _route!.first.y);
+        _liveMapFloorId = _route!.first.floorId;
+        _previewingFloorId = null;
       });
       _updateLocation(position);
       _locationSubscription = _locationProvider.watchPosition().listen(
@@ -170,57 +242,25 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
     }
   }
 
-  bool _isPositionInsideMall(Position position) {
-    final centerLatitude = widget.latitude;
-    final centerLongitude = widget.longitude;
-    final radius = widget.radiusMeters;
-    if (centerLatitude == null ||
-        centerLongitude == null ||
-        radius == null) {
-      return false;
-    }
-    return isInsideGeofence(
-      latitude: position.latitude,
-      longitude: position.longitude,
-      centerLatitude: centerLatitude,
-      centerLongitude: centerLongitude,
-      radiusMeters: radius,
-    );
-  }
-
   void _updateLocation(Position position) {
     if (!mounted) return;
-    final inside = _isPositionInsideMall(position);
-    final location = inside
-        ? projectLocationToMap(
-            latitude: position.latitude,
-            longitude: position.longitude,
-            calibrationPoints: widget.calibrationPoints,
-          )
-        : null;
+    final location = _advanceLiveMapLocation(position);
     setState(() {
       _position = position;
-      _isInsideMall = inside;
-      if (!inside) _isNavigating = false;
-      _locationStatus = inside
-          ? location == null
-                ? 'GPS is inside the mall, but outside the calibrated map area.'
-                : 'Live location · about ${position.accuracy.round()} m accuracy'
-          : 'You appear to be outside the ${widget.radiusMeters!.round()} m mall area.';
+      _locationStatus = location == null
+          ? 'Movement tracking needs a valid floor scale.'
+          : 'Blue dot starts at your selected point and follows your movement.';
     });
-    if (!inside) {
-      _stopLocationTracking();
-      return;
-    }
 
     final destination = _route?.last;
-    if (destination != null) {
-      final distance = distanceToMapPointMeters(
-        latitude: position.latitude,
-        longitude: position.longitude,
-        mapX: destination.x,
-        mapY: destination.y,
-        calibrationPoints: widget.calibrationPoints,
+    final liveLocation = _liveMapLocation;
+    if (destination != null &&
+        liveLocation != null &&
+        destination.floorId == _liveMapFloorId) {
+      final distance = mapDistanceMeters(
+        from: liveLocation,
+        to: Offset(destination.x, destination.y),
+        calibrationPoints: _calibrationForFloor(destination.floorId),
       );
       if (distance != null && distance <= 12 && !_hasArrived) {
         setState(() {
@@ -233,32 +273,158 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
     }
   }
 
+  Offset? _advanceLiveMapLocation(Position position) {
+    final previous = _previousMovementPosition;
+    var nextLocation = _liveMapLocation;
+    if (previous != null && nextLocation != null) {
+      final floorId = _liveMapFloorId;
+      if (floorId != null) {
+        final update = estimateRelativeMovement(
+          previous: previous,
+          current: position,
+          calibrationPoints: _calibrationForFloor(floorId),
+        );
+        final movement = update.mapOffset;
+        if (movement != null) {
+          nextLocation = Offset(
+            nextLocation.dx + movement.dx,
+            nextLocation.dy + movement.dy,
+          );
+        }
+        if (update.shouldAdvanceBaseline) {
+          _previousMovementPosition = position;
+        }
+      }
+    } else {
+      _previousMovementPosition = position;
+    }
+    _liveMapLocation = nextLocation;
+    return _liveMapFloorId == _activeFloor.id &&
+            _previewingFloorId != _activeFloor.id
+        ? nextLocation
+        : null;
+  }
+
+  Future<void> _selectFloor(String floorId) async {
+    if (floorId == _selectedFloorId && _previewingFloorId != floorId) return;
+    if (!_isNavigating || floorId == _liveMapFloorId) {
+      setState(() {
+        _selectedFloorId = floorId;
+        if (floorId == _liveMapFloorId) _previewingFloorId = null;
+      });
+      return;
+    }
+
+    final floorName = _effectiveFloors
+        .firstWhere((floor) => floor.id == floorId)
+        .name;
+    final didChangeFloors = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Switching floors?'),
+        content: Text(
+          'Are you physically on $floorName, or are you just previewing its map?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Just previewing'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('I changed floors'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || didChangeFloors == null) return;
+
+    if (!didChangeFloors) {
+      setState(() {
+        _selectedFloorId = floorId;
+        _previewingFloorId = floorId;
+      });
+      return;
+    }
+
+    MapNode? transferPoint;
+    for (final node in _route ?? const <MapNode>[]) {
+      if (node.floorId == floorId) {
+        transferPoint = node;
+        break;
+      }
+    }
+    if (transferPoint == null) {
+      _showMessage('The planned route has no transfer point on this floor.');
+      setState(() {
+        _selectedFloorId = floorId;
+        _previewingFloorId = floorId;
+      });
+      return;
+    }
+
+    setState(() {
+      _selectedFloorId = floorId;
+      _liveMapFloorId = floorId;
+      _previewingFloorId = null;
+      _previousMovementPosition = _position;
+      _liveMapLocation = Offset(transferPoint!.x, transferPoint.y);
+      _locationStatus = 'Location transferred to $floorName.';
+    });
+  }
+
   void _showMessage(String message) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
+  void _openFullScreen() {
+    final route = _isNavigating || _hasArrived ? _route : null;
+    final projectedLocation =
+        _liveMapFloorId == _activeFloor.id &&
+            _previewingFloorId != _activeFloor.id
+        ? _liveMapLocation
+        : null;
+    final location = projectedLocation == null
+        ? null
+        : clampLocationToMap(projectedLocation);
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => FullScreenMapScreen(
+          imagePath: _activeFloor.imagePath.isEmpty
+              ? null
+              : _activeFloor.imagePath,
+          nodes: _nodesForRoute(route),
+          floorId: _activeFloor.id,
+          connections: _connectionsForRoute(route),
+          calibrationPoints: _calibrationForFloor(_activeFloor.id),
+          routeNodeIds: route?.map((node) => node.id).toList(),
+          destinationNodeId: _destinationId,
+          deviceLocation: location,
+          trackLiveLocation: _isNavigating,
+          locationProvider: _locationProvider,
+          initialPosition: _position,
+          initialMapLocation: location,
+          compactMarkers: true,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final route = _route;
-    final routeIds = route?.map((node) => node.id).toList();
-    final position = _position;
-    final deviceLocation = position == null || _isInsideMall != true
-        ? null
-        : projectLocationToMap(
-            latitude: position.latitude,
-            longitude: position.longitude,
-            calibrationPoints: widget.calibrationPoints,
-          );
-    final visibleLocation =
-        deviceLocation != null &&
-            deviceLocation.dx >= 0 &&
-            deviceLocation.dx <= 1 &&
-            deviceLocation.dy >= 0 &&
-            deviceLocation.dy <= 1
-        ? deviceLocation
+    final showRoute = _isNavigating || _hasArrived;
+    final routeIds = showRoute ? route?.map((node) => node.id).toList() : null;
+    final projectedLocation =
+        _liveMapFloorId == _activeFloor.id &&
+            _previewingFloorId != _activeFloor.id
+        ? _liveMapLocation
         : null;
+    final visibleLocation = projectedLocation == null
+        ? null
+        : clampLocationToMap(projectedLocation);
     return Scaffold(
       appBar: AppBar(
         leading: IconButton(
@@ -293,6 +459,7 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
               icon: Icons.my_location_rounded,
               value: _originId,
               nodes: widget.nodes,
+              floors: _effectiveFloors,
               onChanged: (id) {
                 setState(() {
                   _originId = id;
@@ -307,6 +474,7 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
               icon: Icons.location_on_outlined,
               value: _destinationId,
               nodes: widget.nodes,
+              floors: _effectiveFloors,
               onChanged: (id) {
                 setState(() {
                   _destinationId = id;
@@ -315,34 +483,59 @@ class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
               },
             ),
             const SizedBox(height: 16),
+            if (_effectiveFloors.length > 1) ...[
+              const SizedBox(height: 2),
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    for (final floor in _effectiveFloors)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: ChoiceChip(
+                          label: Text(floor.name),
+                          selected: floor.id == _selectedFloorId,
+                          onSelected: (_) => _selectFloor(floor.id),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
             MapPreview(
               height: 340,
-              imagePath: widget.imagePath,
-              nodes: widget.nodes,
-              connections: widget.connections,
-              routeNodeIds: routeIds,
-              currentNodeId: _isNavigating || _hasArrived
+              key: ValueKey(_activeFloor.id),
+              imagePath: _activeFloor.imagePath.isEmpty
                   ? null
-                  : _originId,
+                  : _activeFloor.imagePath,
+              nodes: _nodesForRoute(showRoute ? route : null),
+              floorId: _activeFloor.id,
+              connections: showRoute ? _connectionsForRoute(route) : const [],
+              routeNodeIds: routeIds,
+              currentNodeId: _isNavigating || _hasArrived ? null : _originId,
               destinationNodeId: _destinationId,
               deviceLocation: visibleLocation,
               emptyLabel: '',
               showControls: true,
+              onFullScreenTap: _openFullScreen,
+              compactMarkers: true,
             ),
             const SizedBox(height: 14),
             if (route == null)
               _RouteTip(nodeCount: widget.nodes.length)
             else if (_isNavigating || _hasArrived || _locationStatus != null)
               _NavigationInstructions(
-                destination: route.last.label,
+                destination: route.last.label.isEmpty
+                    ? route.last.type.displayName.toLowerCase()
+                    : route.last.label,
                 hasArrived: _hasArrived,
                 isNavigating: _isNavigating,
                 isStarting: _isStarting,
                 status: _locationStatus,
-                outsideMall: _isInsideMall == false,
               )
             else
-              _RouteSummary(route: route),
+              _RouteSummary(route: route, floors: _effectiveFloors),
             const SizedBox(height: 16),
             SizedBox(
               height: 53,
@@ -396,6 +589,7 @@ class _PlaceSelector extends StatelessWidget {
     required this.icon,
     required this.value,
     required this.nodes,
+    required this.floors,
     required this.onChanged,
   });
 
@@ -404,6 +598,7 @@ class _PlaceSelector extends StatelessWidget {
   final IconData icon;
   final String? value;
   final List<MapNode> nodes;
+  final List<MapFloor> floors;
   final ValueChanged<String?> onChanged;
 
   @override
@@ -420,30 +615,117 @@ class _PlaceSelector extends StatelessWidget {
         ),
       ),
       const SizedBox(height: 6),
-      DropdownButtonFormField<String>(
-        initialValue: value,
-        isExpanded: true,
-        decoration: InputDecoration(
-          hintText: hint,
-          prefixIcon: Icon(icon, size: 20),
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 13,
-            vertical: 11,
-          ),
+      Autocomplete<MapNode>(
+        key: ValueKey('$label:$value'),
+        initialValue: TextEditingValue(
+          text: _selectedNodeLabel(nodes, floors, value),
         ),
-        items: nodes
-            .map(
-              (node) => DropdownMenuItem<String>(
-                value: node.id,
-                child: Text(node.label, overflow: TextOverflow.ellipsis),
+        displayStringForOption: (node) => _routePlaceLabel(node, floors),
+        optionsBuilder: (textEditingValue) {
+          final query = textEditingValue.text.trim().toLowerCase();
+          if (query.isEmpty) return nodes;
+          return nodes.where((node) {
+            final floor = floors.firstWhere(
+              (item) => item.id == node.floorId,
+              orElse: () =>
+                  MapFloor(id: node.floorId, name: 'Floor', imagePath: ''),
+            );
+            final searchableText =
+                '${_routePlaceLabel(node, floors)} ${node.type.displayName} '
+                        '${node.customTypeName ?? ''} ${floor.name}'
+                    .toLowerCase();
+            return searchableText.contains(query);
+          });
+        },
+        onSelected: (node) => onChanged(node.id),
+        fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) =>
+            TextField(
+              controller: controller,
+              focusNode: focusNode,
+              enabled: nodes.isNotEmpty,
+              textInputAction: TextInputAction.search,
+              onSubmitted: (_) => onFieldSubmitted(),
+              decoration: InputDecoration(
+                hintText: nodes.isEmpty ? 'No spots available' : hint,
+                prefixIcon: Icon(icon, size: 20),
+                suffixIcon: const Icon(Icons.search_rounded, size: 20),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 13,
+                  vertical: 11,
+                ),
               ),
-            )
-            .toList(),
-        onChanged: nodes.isEmpty ? null : onChanged,
+            ),
+        optionsViewBuilder: (context, onSelected, options) {
+          final matches = options.toList(growable: false);
+          return Align(
+            alignment: Alignment.topLeft,
+            child: Material(
+              elevation: 5,
+              borderRadius: BorderRadius.circular(12),
+              clipBehavior: Clip.antiAlias,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 240),
+                child: SizedBox(
+                  width: MediaQuery.sizeOf(context).width - 36,
+                  child: ListView.builder(
+                    padding: EdgeInsets.zero,
+                    shrinkWrap: true,
+                    itemCount: matches.length,
+                    itemBuilder: (context, index) {
+                      final node = matches[index];
+                      return ListTile(
+                        dense: true,
+                        leading: Icon(_routePlaceIcon(node.type), size: 20),
+                        title: Text(
+                          _routePlaceLabel(node, floors),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        onTap: () => onSelected(node),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
       ),
     ],
   );
 }
+
+String _selectedNodeLabel(
+  List<MapNode> nodes,
+  List<MapFloor> floors,
+  String? nodeId,
+) {
+  for (final node in nodes) {
+    if (node.id == nodeId) return _routePlaceLabel(node, floors);
+  }
+  return '';
+}
+
+String _routePlaceLabel(MapNode node, List<MapFloor> floors) {
+  final name = node.label.isEmpty ? node.type.displayName : node.label;
+  if (floors.length == 1) return name;
+  final floor = floors.firstWhere(
+    (item) => item.id == node.floorId,
+    orElse: () => MapFloor(id: node.floorId, name: 'Floor', imagePath: ''),
+  );
+  return '$name · ${floor.name}';
+}
+
+IconData _routePlaceIcon(MapNodeType type) => switch (type) {
+  MapNodeType.pathway => Icons.route_rounded,
+  MapNodeType.store => Icons.storefront_outlined,
+  MapNodeType.restroom => Icons.wc_rounded,
+  MapNodeType.elevator => Icons.elevator_rounded,
+  MapNodeType.escalator => Icons.escalator_rounded,
+  MapNodeType.stairs => Icons.stairs_rounded,
+  MapNodeType.custom => Icons.tune_rounded,
+  MapNodeType.place => Icons.place_outlined,
+};
 
 class _RouteTip extends StatelessWidget {
   const _RouteTip({required this.nodeCount});
@@ -480,9 +762,35 @@ class _RouteTip extends StatelessWidget {
 }
 
 class _RouteSummary extends StatelessWidget {
-  const _RouteSummary({required this.route});
+  const _RouteSummary({required this.route, required this.floors});
 
   final List<MapNode> route;
+  final List<MapFloor> floors;
+
+  String _stepLabel(int index) {
+    final node = route[index];
+    if (index == 0) return 'Start at ${_routeNodeName(node)}';
+    if (index == route.length - 1) return 'Arrive at ${_routeNodeName(node)}';
+    final previous = route[index - 1];
+    if (previous.floorId != node.floorId) {
+      final floor = floors.firstWhere(
+        (item) => item.id == node.floorId,
+        orElse: () =>
+            MapFloor(id: node.floorId, name: 'another floor', imagePath: ''),
+      );
+      final transport = switch (node.type) {
+        MapNodeType.elevator => 'elevator',
+        MapNodeType.escalator => 'escalator',
+        MapNodeType.stairs => 'stairs',
+        _ => 'connector',
+      };
+      return 'Take the $transport to ${floor.name}';
+    }
+    return 'Continue to ${_routeNodeName(node)}';
+  }
+
+  String _routeNodeName(MapNode node) =>
+      node.label.isEmpty ? node.type.displayName.toLowerCase() : node.label;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -518,11 +826,7 @@ class _RouteSummary extends StatelessWidget {
                 const SizedBox(width: 9),
                 Expanded(
                   child: Text(
-                    index == 0
-                        ? 'Start at ${route[index].label}'
-                        : index == route.length - 1
-                        ? 'Arrive at ${route[index].label}'
-                        : 'Continue to ${route[index].label}',
+                    _stepLabel(index),
                     style: const TextStyle(fontSize: 13),
                   ),
                 ),
@@ -541,7 +845,6 @@ class _NavigationInstructions extends StatelessWidget {
     required this.isNavigating,
     required this.isStarting,
     this.status,
-    this.outsideMall = false,
   });
 
   final String destination;
@@ -549,32 +852,21 @@ class _NavigationInstructions extends StatelessWidget {
   final bool isNavigating;
   final bool isStarting;
   final String? status;
-  final bool outsideMall;
 
   @override
   Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.all(15),
       decoration: BoxDecoration(
-        color: hasArrived
-            ? const Color(0xFFEAF6EF)
-            : outsideMall
-            ? const Color(0xFFFFF2E8)
-            : const Color(0xFFF3F7FF),
+        color: hasArrived ? const Color(0xFFEAF6EF) : const Color(0xFFF3F7FF),
         borderRadius: BorderRadius.circular(15),
       ),
       child: Row(
         children: [
           Icon(
-            hasArrived
-                ? Icons.check_circle_outline
-                : outsideMall
-                ? Icons.location_off_outlined
-                : Icons.my_location_rounded,
+            hasArrived ? Icons.check_circle_outline : Icons.my_location_rounded,
             color: hasArrived
                 ? const Color(0xFF16885B)
-                : outsideMall
-                ? const Color(0xFFE47721)
                 : const Color(0xFF126BEB),
           ),
           const SizedBox(width: 11),
@@ -587,10 +879,8 @@ class _NavigationInstructions extends StatelessWidget {
                       ? "You've arrived!"
                       : isStarting
                       ? 'Checking your location'
-                      : outsideMall
-                      ? 'Outside the mall area'
                       : isNavigating
-                      ? 'Following your live location'
+                      ? 'Following your movement'
                       : 'Location status',
                   style: const TextStyle(fontWeight: FontWeight.w800),
                 ),
@@ -607,7 +897,7 @@ class _NavigationInstructions extends StatelessWidget {
                 ),
                 const SizedBox(height: 7),
                 const Text(
-                  'Indoor GPS may be inaccurate. The blue dot only moves when your device reports a new location.',
+                  'The blue dot starts at your selected point and moves from your device’s speed and direction.',
                   style: TextStyle(color: Color(0xFF68727A), fontSize: 11),
                 ),
               ],

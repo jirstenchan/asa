@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'models/mall_map.dart';
 import 'screens/create_map_screen.dart';
@@ -6,12 +7,109 @@ import 'screens/route_planner_screen.dart';
 import 'services/map_store.dart';
 import 'widgets/map_preview.dart';
 
-void main() {
-  runApp(const AsaApp());
+const _supabaseUrl = 'https://vytgpmznlovjmntmiglj.supabase.co';
+const _supabasePublishableKey =
+    'sb_publishable_FU6i8PSKoKJUQhaibw4-8g_q2tUxHeE';
+
+abstract interface class AdminAuthService {
+  bool get isAdminSignedIn;
+  Future<bool> signIn(String email, String password);
+  Future<void> signOut();
+}
+
+class SupabaseAdminAuthService implements AdminAuthService {
+  SupabaseAdminAuthService(this._client);
+
+  final SupabaseClient _client;
+
+  @override
+  bool get isAdminSignedIn => _client.auth.currentUser != null;
+
+  @override
+  Future<bool> signIn(String email, String password) async {
+    final response = await _client.auth.signInWithPassword(
+      email: email.trim(),
+      password: password,
+    );
+    return response.user != null;
+  }
+
+  @override
+  Future<void> signOut() => _client.auth.signOut();
+}
+
+final _sampleMallMap = MallMap(
+  id: MapStore.sampleMallMapId,
+  name: 'SM Seaside City Cebu',
+  imagePath: '',
+  floors: const [MapFloor(id: 'ground', name: 'Floor 1', imagePath: '')],
+  nodes: const [
+    MapNode(
+      id: 'entrance',
+      label: 'Main entrance',
+      x: .2,
+      y: .77,
+      floorId: 'ground',
+    ),
+    MapNode(
+      id: 'food-court',
+      label: 'Food court',
+      x: .56,
+      y: .43,
+      floorId: 'ground',
+    ),
+    MapNode(id: 'cinema', label: 'Cinema', x: .82, y: .25, floorId: 'ground'),
+    MapNode(
+      id: 'sm-store',
+      label: 'SM Store',
+      x: .78,
+      y: .76,
+      floorId: 'ground',
+    ),
+  ],
+  connections: const [
+    MapConnection(from: 'entrance', to: 'food-court'),
+    MapConnection(from: 'food-court', to: 'cinema'),
+    MapConnection(from: 'food-court', to: 'sm-store'),
+  ],
+  createdAt: DateTime.utc(2026),
+);
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await Supabase.initialize(
+      url: _supabaseUrl,
+      publishableKey: _supabasePublishableKey,
+    );
+    runApp(const AsaApp());
+  } catch (error) {
+    runApp(_StartupErrorApp(error: error));
+  }
+}
+
+class _StartupErrorApp extends StatelessWidget {
+  const _StartupErrorApp({required this.error});
+
+  final Object error;
+
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+    home: Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text('Could not initialize the app: $error'),
+        ),
+      ),
+    ),
+  );
 }
 
 class AsaApp extends StatelessWidget {
-  const AsaApp({super.key});
+  const AsaApp({super.key, this.adminAuth});
+
+  final AdminAuthService? adminAuth;
 
   @override
   Widget build(BuildContext context) => MaterialApp(
@@ -51,12 +149,14 @@ class AsaApp extends StatelessWidget {
         ),
       ),
     ),
-    home: const AppShell(),
+    home: AppShell(adminAuth: adminAuth),
   );
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({super.key});
+  const AppShell({super.key, this.adminAuth});
+
+  final AdminAuthService? adminAuth;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -64,10 +164,25 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   final _store = MapStore();
+  late final AdminAuthService _adminAuth =
+      widget.adminAuth ?? SupabaseAdminAuthService(Supabase.instance.client);
   int _selectedTab = 0;
   List<MallMap> _maps = [];
   bool _loadingMaps = true;
   String? _loadError;
+  int _settingsTapCount = 0;
+  bool _isAdmin = false;
+  bool _loadingAdminSession = true;
+  bool _sampleMallMapDeleted = false;
+
+  List<MallMap> get _availableMaps => [
+    if (!_sampleMallMapDeleted)
+      _maps.firstWhere(
+        (map) => map.id == _sampleMallMap.id,
+        orElse: () => _sampleMallMap,
+      ),
+    ..._maps.where((map) => map.id != _sampleMallMap.id),
+  ];
 
   @override
   void initState() {
@@ -76,11 +191,20 @@ class _AppShellState extends State<AppShell> {
   }
 
   Future<void> _loadMaps() async {
+    if (mounted) {
+      setState(() {
+        _isAdmin = _adminAuth.isAdminSignedIn;
+        _loadingAdminSession = false;
+      });
+    }
+
     try {
       final maps = await _store.loadMaps();
+      final sampleMallMapDeleted = await _store.isSampleMallMapDeleted();
       if (mounted) {
         setState(() {
           _maps = maps;
+          _sampleMallMapDeleted = sampleMallMapDeleted;
           _loadingMaps = false;
           _loadError = null;
         });
@@ -95,24 +219,102 @@ class _AppShellState extends State<AppShell> {
     }
   }
 
-  Future<void> _createMap() async {
+  Future<void> _openMapEditor({MallMap? existingMap}) async {
     final created = await Navigator.of(context).push<MallMap>(
-      MaterialPageRoute(builder: (_) => CreateMapScreen(store: _store)),
+      MaterialPageRoute(
+        builder: (_) => CreateMapScreen(store: _store, initialMap: existingMap),
+      ),
     );
     if (created != null && mounted) {
       setState(() {
-        _maps.insert(0, created);
-        _selectedTab = 1;
+        final index = _maps.indexWhere((map) => map.id == created.id);
+        if (index < 0) {
+          _maps.insert(0, created);
+        } else {
+          _maps[index] = created;
+        }
       });
     }
   }
 
-  Future<void> _deleteMap(MallMap map) async {
+  Future<void> _createMap() => _openMapEditor();
+
+  Future<void> _editMap(MallMap map) => _openMapEditor(existingMap: map);
+
+  void _openAdminMaps() {
+    Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => _AdminMapListScreen(
+          maps: [
+            if (!_sampleMallMapDeleted)
+              _maps.firstWhere(
+                (map) => map.id == _sampleMallMap.id,
+                orElse: () => _sampleMallMap,
+              ),
+            ..._maps.where((map) => map.id != _sampleMallMap.id),
+          ],
+          isLoading: _loadingMaps,
+          loadError: _loadError,
+          onRetry: _loadMaps,
+          onEditMap: _editMap,
+          onDeleteMap: _deleteMap,
+        ),
+      ),
+    );
+  }
+
+  void _registerSettingsTap() {
+    if (_isAdmin || _loadingAdminSession) return;
+    _settingsTapCount++;
+    if (_settingsTapCount >= 10) {
+      _settingsTapCount = 0;
+      _showAdminLogin();
+    }
+  }
+
+  void _selectTab(int index) {
+    if (index == 2) {
+      _registerSettingsTap();
+    } else {
+      _settingsTapCount = 0;
+    }
+    setState(() => _selectedTab = index);
+  }
+
+  Future<void> _showAdminLogin() async {
+    final signedIn = await showDialog<bool>(
+      context: context,
+      builder: (_) => _AdminLoginDialog(onLogin: _adminAuth.signIn),
+    );
+    if (!mounted || signedIn != true) return;
+    if (_adminAuth.isAdminSignedIn) {
+      setState(() => _isAdmin = true);
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Admin mode enabled.')));
+    }
+  }
+
+  Future<void> _logoutAdmin() async {
+    try {
+      await _adminAuth.signOut();
+      if (mounted) setState(() => _isAdmin = false);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not log out of admin mode: $error')),
+        );
+      }
+    }
+  }
+
+  Future<bool> _deleteMap(MallMap map) async {
     final shouldDelete = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Delete map?'),
-        content: Text('“${map.name}” and its saved floor plan will be removed.'),
+        content: Text(
+          '“${map.name}” and its saved floor plan will be removed.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -125,38 +327,61 @@ class _AppShellState extends State<AppShell> {
         ],
       ),
     );
-    if (shouldDelete != true || !mounted) return;
+    if (shouldDelete != true || !mounted) return false;
     try {
       await _store.deleteMap(map.id);
-      if (mounted) setState(() => _maps.removeWhere((item) => item.id == map.id));
+      final maps = await _store.loadMaps();
+      final sampleMallMapDeleted = await _store.isSampleMallMapDeleted();
+      if (mounted) {
+        setState(() {
+          _maps = maps;
+          _sampleMallMapDeleted = sampleMallMapDeleted;
+        });
+      }
+      return true;
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Could not delete this map: $error')),
         );
       }
+      return false;
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final pages = [
-      _HomeScreen(onOpenMaps: () => setState(() => _selectedTab = 1)),
+      _HomeScreen(
+        maps: _availableMaps,
+        onOpenMaps: () => setState(() => _selectedTab = 1),
+      ),
       _MapsScreen(
-        maps: _maps,
+        key: ValueKey(_maps.map((map) => map.id).join('|')),
+        maps: _maps.where((map) => map.id != _sampleMallMap.id).toList(),
+        sampleMap: _sampleMallMapDeleted
+            ? null
+            : _maps.firstWhere(
+                (map) => map.id == _sampleMallMap.id,
+                orElse: () => _sampleMallMap,
+              ),
         isLoading: _loadingMaps,
         loadError: _loadError,
         onRetry: _loadMaps,
-        onCreateMap: _createMap,
-        onDeleteMap: _deleteMap,
       ),
-      _SettingsScreen(onCreateMap: _createMap),
+      _SettingsScreen(
+        isAdmin: _isAdmin,
+        onSettingsTap: _registerSettingsTap,
+        onAdminLogout: _logoutAdmin,
+        onOpenMaps: _openAdminMaps,
+        onCreateMap: _createMap,
+      ),
     ];
     return Scaffold(
       body: IndexedStack(index: _selectedTab, children: pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedTab,
-        onDestinationSelected: (index) => setState(() => _selectedTab = index),
+        onDestinationSelected: _selectTab,
         backgroundColor: Colors.white,
         indicatorColor: const Color(0xFFFFE8EA),
         destinations: const [
@@ -182,8 +407,9 @@ class _AppShellState extends State<AppShell> {
 }
 
 class _HomeScreen extends StatelessWidget {
-  const _HomeScreen({required this.onOpenMaps});
+  const _HomeScreen({required this.maps, required this.onOpenMaps});
 
+  final List<MallMap> maps;
   final VoidCallback onOpenMaps;
 
   @override
@@ -294,56 +520,27 @@ class _HomeScreen extends StatelessWidget {
           onTap: onOpenMaps,
         ),
         const SizedBox(height: 13),
-        _RecommendedMapCard(onTap: onOpenMaps),
-        const SizedBox(height: 27),
-        Row(
-          children: [
-            const Expanded(
-              child: Text(
-                'Frequently visited',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
-              ),
-            ),
-            TextButton(onPressed: onOpenMaps, child: const Text('See all')),
-          ],
-        ),
-        const SizedBox(height: 5),
-        _FrequentlyVisitedTile(
-          icon: Icons.shopping_bag_outlined,
-          title: 'SM Seaside City Cebu',
-          subtitle: 'Shopping · Cebu City',
-          color: const Color(0xFFE92332),
-          onTap: onOpenMaps,
-        ),
-        _FrequentlyVisitedTile(
-          icon: Icons.local_cafe_outlined,
-          title: 'Coffee & cafés',
-          subtitle: 'Discover places nearby',
-          color: const Color(0xFF16885B),
-          onTap: onOpenMaps,
-        ),
-        const SizedBox(height: 12),
-        OutlinedButton.icon(
-          onPressed: onOpenMaps,
-          icon: const Icon(Icons.add_location_alt_outlined),
-          label: const Text('Browse all maps'),
-          style: OutlinedButton.styleFrom(
-            minimumSize: const Size.fromHeight(50),
-            foregroundColor: const Color(0xFF25292D),
-            side: const BorderSide(color: Color(0xFFE2E5E7)),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(15),
+        if (maps.isEmpty)
+          const Text(
+            'There aren’t any malls available yet.',
+            style: TextStyle(color: Color(0xFF737B81)),
+          )
+        else
+          ...maps.map(
+            (map) => Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _RecommendedMapCard(map: map, onTap: onOpenMaps),
             ),
           ),
-        ),
       ],
     ),
   );
 }
 
 class _RecommendedMapCard extends StatelessWidget {
-  const _RecommendedMapCard({required this.onTap});
+  const _RecommendedMapCard({required this.map, required this.onTap});
 
+  final MallMap map;
   final VoidCallback onTap;
 
   @override
@@ -363,23 +560,31 @@ class _RecommendedMapCard extends StatelessWidget {
             height: 92,
             child: ClipRRect(
               borderRadius: BorderRadius.circular(13),
-              child: const MapPreview(height: 92, emptyLabel: ''),
+              child: MapPreview(
+                height: 92,
+                imagePath: map.imagePath.isEmpty ? null : map.imagePath,
+                floorId: map.effectiveFloors.first.id,
+                emptyLabel: '',
+                fillImageWidth: true,
+              ),
             ),
           ),
           const SizedBox(width: 13),
-          const Expanded(
+          Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'SM Seaside City Cebu',
+                  map.name,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
                 ),
                 SizedBox(height: 6),
                 Text(
-                  'Your mall, made easy to explore',
+                  '${map.effectiveFloors.length} '
+                  'floor${map.effectiveFloors.length == 1 ? '' : 's'} · '
+                  '${map.nodes.length} spots',
                   style: TextStyle(color: Color(0xFF777F85), fontSize: 12),
                 ),
                 SizedBox(height: 7),
@@ -410,51 +615,21 @@ class _RecommendedMapCard extends StatelessWidget {
   );
 }
 
-class _FrequentlyVisitedTile extends StatelessWidget {
-  const _FrequentlyVisitedTile({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    required this.color,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final Color color;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => ListTile(
-    onTap: onTap,
-    contentPadding: const EdgeInsets.symmetric(horizontal: 2),
-    leading: CircleAvatar(
-      backgroundColor: color.withValues(alpha: .11),
-      child: Icon(icon, color: color),
-    ),
-    title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
-    subtitle: Text(subtitle, style: const TextStyle(fontSize: 12)),
-    trailing: const Icon(Icons.chevron_right_rounded),
-  );
-}
-
 class _MapsScreen extends StatelessWidget {
   const _MapsScreen({
+    super.key,
     required this.maps,
+    required this.sampleMap,
     required this.isLoading,
     required this.loadError,
     required this.onRetry,
-    required this.onCreateMap,
-    required this.onDeleteMap,
   });
 
   final List<MallMap> maps;
+  final MallMap? sampleMap;
   final bool isLoading;
   final String? loadError;
   final VoidCallback onRetry;
-  final VoidCallback onCreateMap;
-  final ValueChanged<MallMap> onDeleteMap;
 
   @override
   Widget build(BuildContext context) => SafeArea(
@@ -470,11 +645,6 @@ class _MapsScreen extends StatelessWidget {
                   'Maps',
                   style: TextStyle(fontSize: 27, fontWeight: FontWeight.w900),
                 ),
-              ),
-              IconButton.filledTonal(
-                onPressed: onCreateMap,
-                tooltip: 'Create map',
-                icon: const Icon(Icons.add),
               ),
             ],
           ),
@@ -500,34 +670,32 @@ class _MapsScreen extends StatelessWidget {
                   'Find your way, one stop at a time.',
                   style: TextStyle(color: Color(0xFF737B81)),
                 ),
-                const SizedBox(height: 18),
-                _SampleMapCard(onTap: () => _openSampleMap(context)),
-                if (maps.isNotEmpty) ...[
-                  const SizedBox(height: 26),
-                  const Text(
-                    'YOUR MAPS',
-                    style: TextStyle(
-                      fontSize: 11,
-                      letterSpacing: 1.2,
-                      color: Color(0xFF878E93),
-                      fontWeight: FontWeight.w800,
-                    ),
+                if (sampleMap != null) ...[
+                  const SizedBox(height: 18),
+                  _SampleMapCard(
+                    map: sampleMap!,
+                    onTap: () => _openMap(context, sampleMap!),
                   ),
-                  const SizedBox(height: 11),
+                ],
+                if (maps.isNotEmpty) ...[
+                  if (sampleMap != null) const SizedBox(height: 18),
                   ...maps.map(
                     (map) => Padding(
                       padding: const EdgeInsets.only(bottom: 13),
-                      child: _SavedMapCard(
+                      child: _SampleMapCard(
                         map: map,
                         onTap: () => _openMap(context, map),
-                        onDelete: () => onDeleteMap(map),
                       ),
                     ),
                   ),
-                ] else
+                ],
+                if (maps.isEmpty && sampleMap == null)
                   Padding(
                     padding: const EdgeInsets.only(top: 25),
-                    child: _EmptyMaps(onCreateMap: onCreateMap),
+                    child: const Text(
+                      'There aren’t any maps available yet.',
+                      style: TextStyle(color: Color(0xFF737B81)),
+                    ),
                   ),
               ],
             ),
@@ -542,7 +710,8 @@ class _MapsScreen extends StatelessWidget {
       MaterialPageRoute(
         builder: (_) => RoutePlannerScreen(
           mallName: map.name,
-          imagePath: map.imagePath,
+          imagePath: map.imagePath.isEmpty ? null : map.imagePath,
+          floors: map.effectiveFloors,
           nodes: map.nodes,
           connections: map.connections,
           latitude: map.latitude,
@@ -553,35 +722,12 @@ class _MapsScreen extends StatelessWidget {
       ),
     );
   }
-
-  void _openSampleMap(BuildContext context) {
-    const nodes = [
-      MapNode(id: 'entrance', label: 'Main entrance', x: .2, y: .77),
-      MapNode(id: 'food-court', label: 'Food court', x: .56, y: .43),
-      MapNode(id: 'cinema', label: 'Cinema', x: .82, y: .25),
-      MapNode(id: 'sm-store', label: 'SM Store', x: .78, y: .76),
-    ];
-    const connections = [
-      MapConnection(from: 'entrance', to: 'food-court'),
-      MapConnection(from: 'food-court', to: 'cinema'),
-      MapConnection(from: 'food-court', to: 'sm-store'),
-    ];
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => const RoutePlannerScreen(
-          mallName: 'SM Seaside',
-          nodes: nodes,
-          connections: connections,
-        ),
-      ),
-    );
-  }
 }
 
 class _SampleMapCard extends StatelessWidget {
-  const _SampleMapCard({required this.onTap});
+  const _SampleMapCard({required this.map, required this.onTap});
 
+  final MallMap map;
   final VoidCallback onTap;
 
   @override
@@ -599,9 +745,15 @@ class _SampleMapCard extends StatelessWidget {
         children: [
           ClipRRect(
             borderRadius: BorderRadius.circular(15),
-            child: const MapPreview(height: 168, emptyLabel: ''),
+            child: MapPreview(
+              height: 168,
+              imagePath: map.imagePath.isEmpty ? null : map.imagePath,
+              floorId: map.effectiveFloors.first.id,
+              emptyLabel: 'Floor plan is not available yet',
+              fillImageWidth: true,
+            ),
           ),
-          const Padding(
+          Padding(
             padding: EdgeInsets.fromLTRB(6, 12, 6, 3),
             child: Row(
               children: [
@@ -610,7 +762,7 @@ class _SampleMapCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'SM Seaside City Cebu',
+                        map.name,
                         style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w800,
@@ -618,7 +770,8 @@ class _SampleMapCard extends StatelessWidget {
                       ),
                       SizedBox(height: 4),
                       Text(
-                        'Cebu City · Sample map',
+                        'Cebu City · ${map.effectiveFloors.length} floor'
+                        '${map.effectiveFloors.length == 1 ? '' : 's'}',
                         style: TextStyle(
                           color: Color(0xFF777F85),
                           fontSize: 12,
@@ -637,123 +790,302 @@ class _SampleMapCard extends StatelessWidget {
   );
 }
 
-class _SavedMapCard extends StatelessWidget {
-  const _SavedMapCard({
+class _AdminMapCard extends StatelessWidget {
+  const _AdminMapCard({
     required this.map,
-    required this.onTap,
+    required this.onEdit,
     required this.onDelete,
   });
 
   final MallMap map;
-  final VoidCallback onTap;
+  final VoidCallback onEdit;
   final VoidCallback onDelete;
 
   @override
-  Widget build(BuildContext context) => InkWell(
-    onTap: onTap,
-    borderRadius: BorderRadius.circular(18),
-    child: Container(
-      padding: const EdgeInsets.all(9),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF5F6F7),
-        borderRadius: BorderRadius.circular(18),
-      ),
-      child: Row(
-        children: [
-          ClipRRect(
-            borderRadius: BorderRadius.circular(12),
-            child: SizedBox(
-              width: 100,
-              height: 82,
-              child: MapPreview(
-                height: 82,
-                imagePath: map.imagePath,
-                nodes: map.nodes,
-                connections: map.connections,
-                emptyLabel: '',
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
+  Widget build(BuildContext context) => Container(
+    decoration: BoxDecoration(
+      color: const Color(0xFFF4F5F6),
+      borderRadius: BorderRadius.circular(21),
+    ),
+    child: Column(
+      children: [
+        InkWell(
+          key: Key('admin-map-${map.id}'),
+          onTap: onEdit,
+          borderRadius: BorderRadius.circular(21),
+          child: Padding(
+            padding: const EdgeInsets.all(10),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  map.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w800,
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(15),
+                  child: MapPreview(
+                    height: 168,
+                    imagePath: map.imagePath.isEmpty ? null : map.imagePath,
+                    floorId: map.effectiveFloors.first.id,
+                    emptyLabel: 'Upload a floor plan to preview this map',
+                    fillImageWidth: true,
                   ),
                 ),
-                const SizedBox(height: 5),
-                Text(
-                  '${map.nodes.length} spots · ${map.connections.length} paths',
-                  style: const TextStyle(
-                    color: Color(0xFF737B81),
-                    fontSize: 12,
-                  ),
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  _dateLabel(map.createdAt),
-                  style: const TextStyle(
-                    color: Color(0xFF92999E),
-                    fontSize: 11,
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(6, 12, 6, 3),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              map.name,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${map.effectiveFloors.length} '
+                              'floor${map.effectiveFloors.length == 1 ? '' : 's'}'
+                              ' · ${map.nodes.length} nodes',
+                              style: const TextStyle(
+                                color: Color(0xFF777F85),
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Icon(Icons.arrow_forward_rounded),
+                    ],
                   ),
                 ),
               ],
             ),
           ),
-          IconButton(
-            tooltip: 'Delete ${map.name}',
-            onPressed: onDelete,
-            icon: const Icon(Icons.delete_outline_rounded),
+        ),
+        Align(
+          alignment: Alignment.centerRight,
+          child: Padding(
+            padding: const EdgeInsets.only(right: 8, bottom: 5),
+            child: TextButton.icon(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete_outline_rounded, size: 18),
+              label: const Text('Delete map'),
+              style: TextButton.styleFrom(foregroundColor: Colors.red.shade700),
+            ),
           ),
-        ],
-      ),
-    ),
-  );
-}
-
-class _EmptyMaps extends StatelessWidget {
-  const _EmptyMaps({required this.onCreateMap});
-
-  final VoidCallback onCreateMap;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.all(20),
-    decoration: BoxDecoration(
-      color: const Color(0xFFF8F8F9),
-      borderRadius: BorderRadius.circular(19),
-    ),
-    child: Column(
-      children: [
-        const Icon(Icons.add_location_alt_outlined, size: 30),
-        const SizedBox(height: 9),
-        const Text(
-          'Make a map of your own',
-          style: TextStyle(fontWeight: FontWeight.w800),
         ),
-        const SizedBox(height: 5),
-        const Text(
-          'Upload a floor plan, place spots and draw paths.',
-          textAlign: TextAlign.center,
-          style: TextStyle(color: Color(0xFF777F85), fontSize: 12),
-        ),
-        const SizedBox(height: 12),
-        FilledButton(onPressed: onCreateMap, child: const Text('Create map')),
       ],
     ),
   );
 }
 
-class _SettingsScreen extends StatefulWidget {
-  const _SettingsScreen({required this.onCreateMap});
+class _AdminMapListScreen extends StatefulWidget {
+  const _AdminMapListScreen({
+    required this.maps,
+    required this.isLoading,
+    required this.loadError,
+    required this.onRetry,
+    required this.onEditMap,
+    required this.onDeleteMap,
+  });
 
+  final List<MallMap> maps;
+  final bool isLoading;
+  final String? loadError;
+  final VoidCallback onRetry;
+  final Future<void> Function(MallMap) onEditMap;
+  final Future<bool> Function(MallMap) onDeleteMap;
+
+  @override
+  State<_AdminMapListScreen> createState() => _AdminMapListScreenState();
+}
+
+class _AdminMapListScreenState extends State<_AdminMapListScreen> {
+  late List<MallMap> _maps = widget.maps;
+
+  @override
+  void didUpdateWidget(covariant _AdminMapListScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.maps, widget.maps)) _maps = widget.maps;
+  }
+
+  Future<void> _deleteMap(MallMap map) async {
+    final deleted = await widget.onDeleteMap(map);
+    if (deleted && mounted) {
+      setState(() => _maps.removeWhere((item) => item.id == map.id));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: const Text('Maps'),
+      leading: IconButton(
+        tooltip: 'Go back',
+        onPressed: () => Navigator.pop(context),
+        icon: const Icon(Icons.arrow_back_ios_new_rounded),
+      ),
+    ),
+    body: SafeArea(
+      child: widget.isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : widget.loadError != null
+          ? Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Text(widget.loadError!),
+                  ),
+                  TextButton(
+                    onPressed: widget.onRetry,
+                    child: const Text('Try again'),
+                  ),
+                ],
+              ),
+            )
+          : ListView(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+              children: [
+                const Text(
+                  'Select a map to edit it.',
+                  style: TextStyle(color: Color(0xFF737B81)),
+                ),
+                const SizedBox(height: 18),
+                for (final map in _maps)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 13),
+                    child: _AdminMapCard(
+                      map: map,
+                      onEdit: () => widget.onEditMap(map),
+                      onDelete: () => _deleteMap(map),
+                    ),
+                  ),
+              ],
+            ),
+    ),
+  );
+}
+
+class _AdminLoginDialog extends StatefulWidget {
+  const _AdminLoginDialog({required this.onLogin});
+
+  final Future<bool> Function(String email, String password) onLogin;
+
+  @override
+  State<_AdminLoginDialog> createState() => _AdminLoginDialogState();
+}
+
+class _AdminLoginDialogState extends State<_AdminLoginDialog> {
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _signingIn = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Admin login'),
+    content: SizedBox(
+      width: 360,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            key: const Key('admin-email'),
+            controller: _emailController,
+            autofocus: true,
+            keyboardType: TextInputType.emailAddress,
+            autofillHints: const [AutofillHints.username],
+            decoration: const InputDecoration(labelText: 'Gmail'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            key: const Key('admin-password'),
+            controller: _passwordController,
+            obscureText: true,
+            autofillHints: const [AutofillHints.password],
+            decoration: const InputDecoration(labelText: 'Password'),
+            onSubmitted: (_) => _signIn(),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 12),
+            Text(
+              _error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ],
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(
+        onPressed: _signingIn ? null : _signIn,
+        child: Text(_signingIn ? 'Signing in…' : 'Sign in'),
+      ),
+    ],
+  );
+
+  Future<void> _signIn() async {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    if (email.isEmpty || password.isEmpty) {
+      setState(() => _error = 'Enter your Gmail and password.');
+      return;
+    }
+    setState(() {
+      _signingIn = true;
+      _error = null;
+    });
+    try {
+      final signedIn = await widget.onLogin(email, password);
+      if (!mounted) return;
+      if (signedIn) {
+        Navigator.pop(context, true);
+      } else {
+        setState(() {
+          _signingIn = false;
+          _error = 'Supabase did not return a signed-in account.';
+        });
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _signingIn = false;
+        _error =
+            'Sign-in failed. Check your Gmail and password, then try again.';
+      });
+    }
+  }
+}
+
+class _SettingsScreen extends StatefulWidget {
+  const _SettingsScreen({
+    required this.isAdmin,
+    required this.onSettingsTap,
+    required this.onAdminLogout,
+    required this.onOpenMaps,
+    required this.onCreateMap,
+  });
+
+  final bool isAdmin;
+  final VoidCallback onSettingsTap;
+  final VoidCallback onAdminLogout;
+  final VoidCallback onOpenMaps;
   final VoidCallback onCreateMap;
 
   @override
@@ -768,9 +1100,12 @@ class _SettingsScreenState extends State<_SettingsScreen> {
     child: ListView(
       padding: const EdgeInsets.fromLTRB(20, 24, 20, 28),
       children: [
-        const Text(
-          'Settings',
-          style: TextStyle(fontSize: 27, fontWeight: FontWeight.w900),
+        InkWell(
+          onTap: widget.onSettingsTap,
+          child: const Text(
+            'Settings',
+            style: TextStyle(fontSize: 27, fontWeight: FontWeight.w900),
+          ),
         ),
         const SizedBox(height: 23),
         Container(
@@ -779,20 +1114,22 @@ class _SettingsScreenState extends State<_SettingsScreen> {
             color: const Color(0xFFF5F6F7),
             borderRadius: BorderRadius.circular(20),
           ),
-          child: const Column(
+          child: Column(
             children: [
               CircleAvatar(
                 radius: 27,
                 backgroundColor: Colors.white,
                 child: Icon(
-                  Icons.person_rounded,
+                  widget.isAdmin
+                      ? Icons.admin_panel_settings_rounded
+                      : Icons.person_rounded,
                   size: 31,
                   color: Color(0xFF737B81),
                 ),
               ),
               SizedBox(height: 9),
               Text(
-                'THE ASA USER',
+                widget.isAdmin ? 'THE ASA ADMIN' : 'THE ASA USER',
                 style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
               ),
               SizedBox(height: 4),
@@ -830,11 +1167,37 @@ class _SettingsScreenState extends State<_SettingsScreen> {
           title: 'About',
           onTap: () => _showInfoDialog(context, 'About ASA'),
         ),
-        _SettingsTile(
-          icon: Icons.add_location_alt_outlined,
-          title: 'Create map',
-          onTap: widget.onCreateMap,
-        ),
+        if (widget.isAdmin) ...[
+          const SizedBox(height: 12),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            child: Text(
+              'ADMIN',
+              style: TextStyle(
+                color: Color(0xFF92999E),
+                fontSize: 10,
+                letterSpacing: 1,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          _SettingsTile(
+            icon: Icons.map_outlined,
+            title: 'Maps',
+            onTap: widget.onOpenMaps,
+          ),
+          _SettingsTile(
+            icon: Icons.add_location_alt_outlined,
+            title: 'Add map',
+            onTap: widget.onCreateMap,
+          ),
+          _SettingsTile(
+            key: const Key('admin-logout'),
+            icon: Icons.logout_rounded,
+            title: 'Log out of admin account',
+            onTap: widget.onAdminLogout,
+          ),
+        ],
         const Padding(
           padding: EdgeInsets.symmetric(vertical: 18),
           child: Divider(height: 1),
@@ -889,6 +1252,7 @@ class _SettingsScreenState extends State<_SettingsScreen> {
 
 class _SettingsTile extends StatelessWidget {
   const _SettingsTile({
+    super.key,
     required this.icon,
     required this.title,
     required this.onTap,
@@ -984,6 +1348,3 @@ class _SectionTitle extends StatelessWidget {
     ],
   );
 }
-
-String _dateLabel(DateTime date) =>
-    'Added ${date.month}/${date.day}/${date.year}';
