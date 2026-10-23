@@ -66,7 +66,7 @@ The phone's location services must be enabled and location permission granted fo
 | Application screens            | Home, Maps, Settings, route planning, and admin map management.                                            |
 | Map editor                     | Imports floor plans and edits floors, spots, connections, mall coordinates, and optional floor dimensions. |
 | Map storage                    | Saves map metadata with SharedPreferences and floor-plan image copies in the app documents directory.      |
-| Route planner and route finder | Plans a path and finds a route through the map graph using BFS.                                            |
+| Route planner and route finder | Plans a path and finds a route through the map graph using breadth-first search (BFS).                       |
 | Location service               | Requests device location updates and estimates relative movement on the floor plan.                        |
 | Map renderer                   | Draws floor plans, spots, route connections, zoom controls, and the blue location marker.                  |
 | Map data model                 | Represents malls, floors, spots, connections, and optional scale calibration data.                         |
@@ -101,7 +101,7 @@ The phone's location services must be enabled and location permission granted fo
 
 [Open the original diagram in diagrams.net](https://app.diagrams.net/#G1qIpIt_8bde9AnZptSAOIp0qwWZEqPSEJ) · [View the local editable source](docs/diagrams/high-level-architecture.drawio)
 
-The components diagram has been updated to show the implemented BFS route finder and position updates. Both diagrams are architecture overviews; the current implementation details and limitations are described above.
+The components diagram shows the implemented BFS route finder and position updates. Both diagrams are architecture overviews; the current implementation details and limitations are described above.
 
 ## Technology Impact
 
